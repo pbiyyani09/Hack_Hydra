@@ -1,0 +1,38 @@
+## Local single-node HydraDB for development.
+##
+## Start:   docker compose -f hydradb/docker-compose.yml up -d
+## Logs:    docker compose -f hydradb/docker-compose.yml logs -f
+## Stop:    docker compose -f hydradb/docker-compose.yml down
+##
+## Storage is backed by the local filesystem (CLOUD_PROVIDER=local) instead of
+## S3, so no cloud credentials are needed. Data persists in ./data/store.
+
+services:
+  hydradb:
+    image: ghcr.io/hydra-db/hydradb:latest
+    container_name: hydradb
+    restart: unless-stopped
+    # Run as the invoking user so files written into ./data stay owned by us.
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "7687:7687"   # Bolt  - Neo4j-compatible drivers
+      - "8443:8443"   # HTTP  - JSON / NDJSON query API
+      - "9090:9090"   # Admin - health + Prometheus metrics
+    volumes:
+      - ./data:/data
+    environment:
+      CLOUD_PROVIDER: local
+      LOCAL_PATH: /data/store
+      GRAPH_NAMESPACE: default
+      GRAPH_ID: default
+      GRAPH_CELL_ID: cell-0
+      GRAPH_CELLS: cell-0
+      GRAPH_NODE_ID: node-0
+      GRAPH_BOLT_NODE_ADDRESSES: node-0=127.0.0.1:7687
+      GRAPH_ADVERTISED_BOLT_ADDR: 127.0.0.1:7687
+      GRAPH_DATA_CACHE_DIR: /data/cache
+      GRAPH_AUTH_TOKEN_FILE: /data/auth-token
+      # Plaintext is fine locally; do not carry this into any deployed setup.
+      GRAPH_ALLOW_PLAINTEXT: "true"
+      # Cypher planning recurses deeply; the default 8MB stack overflows.
+      RUST_MIN_STACK: "33554432"

@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# HydraDB local runtime
+hydradb/data/
+hydradb/.env
