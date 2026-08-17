@@ -1,0 +1,22 @@
+status: PENDING
+reason: E2-S3's formal hand-check gate (CHECKLIST.md with a human-filled
+  `human: ok/bad` column, facts.jsonl, PASSED, pipeline/scale_gate.py,
+  scripts/handcheck_extract.py) has not been built yet. This directory was
+  created only to hold the not-yet-passed marker the E2-S3 story specifies
+  at fixtures/handcheck/PASSED -- a coding agent must never write PASSED
+  itself (E2-S3.md, "Banned approaches": "Auto-passing the gate from the
+  extractor").
+real-inference artifact available now: samples/extract-eyeball-10056223.md
+  (real `llm.complete()` extraction, gemini-3.5-flash-lite, subject
+  10056223, admissions 26605038 + 20971116, 30 rows shown / 38 facts
+  emitted) plus samples/extract-eyeball-10056223.rule-based.md (the prior
+  rule-based-fallback run, kept for comparison). This eyeball artifact is
+  PHASES.md's lighter "leftover gate" sample, not this formal E2-S3 gate --
+  see scripts/generate_extract_eyeball.py's own docstring for the
+  distinction.
+next step: a human (or the Evidence owner acting as second reader) reviews
+  the ~30 real rows in samples/extract-eyeball-10056223.md against their
+  source turns, and dev-architect/test-lead scope the remaining E2-S3
+  deliverables (CHECKLIST.md, facts.jsonl, scale_gate.py,
+  handcheck_extract.py, tests/test_scale_gate.py) as a follow-up story.
+  Scale ingest stays blocked until PASSED exists.

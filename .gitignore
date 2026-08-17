@@ -216,3 +216,50 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Grok multi-agent harness (local-only, never push) ---
+.grok/
+/AGENTS.md
+# Secrets
+.env
+.env.*
+.secrets/
+# --- end grok-harness ---
+
+# --- Claude Code multi-agent harness (local-only, never push) ---
+.claude/
+CLAUDE.md
+MEMORY.md
+*.claude-log.md
+# Secrets — API keys live here and must never be committed
+.env
+.env.*
+.secrets/
+# --- end harness ---
+
+# --- Cross-harness collaboration workspace (local-only, never push) ---
+collaborative/
+# --- end collaboration workspace ---
+# HydraDB local dev secret — the server-side token file from
+# scripts/run_hydradb.sh (E4-S1). Never commit; it is a shared secret with
+# the client, not a public value, even though the dev value is a placeholder.
+/auth-token
+# Local data — fetched at setup, never vendored (decisions/001)
+data/
+*.pdf.bak
+# Untracked duplicate of the gitignored collaborative/ workspace
+# (collaborative/literature/*, collaborative/literature/GROK-INTAKE.md,
+# collaborative/BUILD-PLAN.html) found sitting at repo root as of this
+# story, byte-identical, and NOT covered by the collaborative/ rule above
+# because it lives at a different path. Flagged in E8-S3's report rather
+# than deleted outright — confirm intent before removing the ignore rule.
+/research/
+
+# --- Submission hygiene (added 2026-08-16) ---
+# Live eval output. Everything currently here predates the LLM wiring and is
+# stub-derived (dry_run / token-overlap fallback judge). Shipping it would read
+# as evidence. At freeze, `git add -f` ONLY the curated report — deliberately.
+results/
+# Original brainstorm note; its plan (Synthea corpus) was superseded by MedLoCoMo.
+message (1).txt
+# --- end submission hygiene ---
