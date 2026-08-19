@@ -81,7 +81,7 @@ from typing import Mapping
 
 import numpy as np
 
-from medmemgraph.contracts import RetrieveItem, RetrieveResult
+from medmemgraph.contracts import SENTINEL_VALID_TO, RetrieveItem, RetrieveResult
 from medmemgraph.graph import embedders, fusion, schema, traverse
 from medmemgraph.graph.existence import exists
 from medmemgraph.graph.lexical import LexicalIndex
@@ -180,6 +180,7 @@ def clear_index_cache() -> None:
     `retrieve()` rebuilds/re-fetches from scratch."""
     _INDEX_CACHE.clear()
     _PATIENT_ENTITY_CACHE.clear()
+    _PATIENT_ID_CACHE.clear()
 
 
 @dataclass(frozen=True)
@@ -415,6 +416,220 @@ def seed_entity_ids(
     return by_label
 
 
+DEFAULT_TIMELINE_ENTITIES = 4
+"""How many seeded entities get a full timeline. Each costs one ordered claim
+query plus one turn lookup per claim, so this bounds the round trips; the
+remaining seeds still contribute path items as before."""
+
+MAX_TIMELINE_CLAIMS = 12
+"""Cap per entity. A patient on a long-term medication can have dozens of
+claims about it; past a dozen the reader is reading a ledger, not evidence."""
+
+
+def entity_timeline(
+    client: HydraClient,
+    patient_id: str,
+    entity_id: int,
+    label: str,
+    *,
+    limit: int = MAX_TIMELINE_CLAIMS,
+) -> list[dict]:
+    """EVERY claim about one entity, for one patient, in chronological order.
+
+    This is the query top-k similarity structurally cannot express, and the
+    reason this project is on a graph at all.
+
+    The failure it fixes, observed directly on the benchmark: asked "compare the
+    etiology of headache in 2160-08 and 2161-04", retrieval returned 6 items
+    from 3 sessions and none of them were headache claims — while the graph held
+    exactly three headache claims, at 2160-08, 2161-04 and 2163-04. Seeding had
+    already picked the right entity. Everything after it went looking for the
+    six most SIMILAR units instead of the ones that were actually ABOUT the
+    thing being asked about.
+
+    Complete coverage of a narrow slice beats a similar-looking sample of
+    everything, for any question whose answer is a comparison or a trend.
+
+    Dialect notes (`hydra_client.validate_dialect`): both node patterns are
+    labelled, the relationship is directed, there is no `IN`, no `IS NULL`, no
+    `CASE`. `ORDER BY` is engine-verified live (2026-08-19) — unlike
+    `count()`/`collect()`, which the gate permits but which have no live usage
+    in this tree, so ordering is done on the wire and everything else
+    client-side.
+
+    Keyed on `:Claim.patient_id`, NOT by walking `(:Patient)-[:HAS]->`: the
+    `:Patient` node is a hub with an edge to every claim, and traversing it is
+    what made `algo.MSpaths` exceed the engine's 30s timeout (see
+    `traverse.DEFAULT_REL_TYPES`). A property lookup on the claim sidesteps the
+    hub entirely.
+    """
+    if label not in schema.DOMAIN_ENTITY_LABELS:
+        raise ValueError(f"{label!r} is not a domain entity label")
+    rows = client.run(
+        f"MATCH (cl:Claim {{patient_id: $pid}})-[:ABOUT]->(e:{label} {{id: $eid}}) "
+        "RETURN cl.id AS id, cl.session_id AS session_id, cl.valid_from AS valid_from, "
+        "cl.valid_to AS valid_to, cl.predicate AS predicate, cl.polarity AS polarity, "
+        "cl.status AS status, cl.confidence AS confidence "
+        "ORDER BY cl.valid_from",
+        pid=patient_id,
+        eid=entity_id,
+    )
+    return rows[:limit]
+
+
+def _turn_text_for_claim(client: HydraClient, claim_id: int) -> tuple[str, list[int], str]:
+    """`(text, turn_ids, session_id)` for one claim's source turns.
+
+    Same query `demo/provenance.py::_fetch_turns` uses. This is what closes the
+    `turn_ids=[]` gap `_path_to_item` documents: a graph item could previously
+    say a dose changed but never quote the sentence that said so, and the gold
+    answers on this benchmark are clinical content ("meningeal signs vs lupus
+    flare"), not schema structure."""
+    try:
+        rows = client.run(
+            "MATCH (c:Claim {id: $cid})-[:DRAWN_FROM]->(t:Turn) "
+            "RETURN t.session_id AS session_id, t.turn_id AS turn_id, t.raw_text AS raw_text",
+            cid=claim_id,
+        )
+    except Exception:  # noqa: BLE001 — evidence without a quote beats no evidence
+        return "", [], ""
+    texts, turn_ids, session_id = [], [], ""
+    for r in rows:
+        if r.get("raw_text"):
+            texts.append(str(r["raw_text"]).strip())
+        if r.get("turn_id") is not None:
+            try:
+                turn_ids.append(int(r["turn_id"]))
+            except (TypeError, ValueError):
+                pass
+        session_id = session_id or str(r.get("session_id") or "")
+    return " ".join(texts), turn_ids, session_id
+
+
+CONTEXT_LABELS = ("Condition", "Procedure")
+"""Entity labels fetched for admission context. A "compare the cause of X"
+question is answered by a CONDITION, and diagnostic PROCEDUREs are what rule
+causes in or out."""
+
+MAX_CONTEXT_ADMISSIONS = 4
+MAX_CONTEXT_PER_ADMISSION = 12
+
+
+def admission_context(
+    client: HydraClient, patient_id: str, session_id: str, *, limit: int = MAX_CONTEXT_PER_ADMISSION
+) -> list[dict]:
+    """What else was claimed in one admission — the co-occurrence hop.
+
+    This exists because of a failure mode timelines alone cannot fix. Every
+    `cross_admission_comparison` item on this benchmark asks to compare the
+    ETIOLOGY of a symptom across dates, and every gold answer is a pair of
+    causes: "meningeal signs vs lupus flare", "volume overload vs pulmonary
+    edema", "liver enzyme elevation versus sepsis".
+
+    The symptom is in the question; the cause is not. So similarity seeding —
+    which embeds the QUESTION — can never retrieve it. Asked to compare the
+    etiology of headache, nothing in the question resembles "lupus", and the
+    system returned six items about headaches and answered "the etiologies were
+    unspecified".
+
+    The graph closes that gap structurally rather than semantically: a timeline
+    tells us WHICH admissions the symptom appeared in, and the cause is
+    whatever else was claimed in those same admissions. For the case above,
+    admission 22661410 carries `lupus asserted` and `meningitis negated` on the
+    same day as the headache — exactly the gold answer, one hop away and
+    unreachable by any amount of embedding quality.
+
+    Dialect-legal: labelled patterns, directed relationship, no `IN`/`IS NULL`/
+    `CASE`. Ordered on the wire; label filtering is client-side because there is
+    no `IN`."""
+    out: list[dict] = []
+    for label in CONTEXT_LABELS:
+        try:
+            rows = client.run(
+                f"MATCH (cl:Claim {{patient_id: $pid, session_id: $sid}})-[:ABOUT]->(e:{label}) "
+                "RETURN e.name AS name, cl.predicate AS predicate, cl.polarity AS polarity, "
+                "cl.valid_from AS valid_from "
+                "ORDER BY cl.valid_from",
+                pid=patient_id,
+                sid=session_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(
+                f"admission context failed for {session_id}/{label}: {type(exc).__name__}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
+        for r in rows:
+            r["label"] = label
+        out.extend(rows)
+    out.sort(key=lambda r: str(r.get("valid_from") or ""))
+    return out[:limit]
+
+
+def _context_item(session_id: str, rows: list[dict], anchor_name: str) -> RetrieveItem | None:
+    """One admission's co-occurring claims, rendered compactly.
+
+    Asserted and negated are kept separate and both are shown: "no signs of
+    meningitis" is exactly as diagnostic as "lupus", and collapsing polarity
+    would destroy the contrast these questions turn on."""
+    if not rows:
+        return None
+    asserted = [r for r in rows if r.get("polarity") != "negated"]
+    negated = [r for r in rows if r.get("polarity") == "negated"]
+    when = str(rows[0].get("valid_from") or "?")[:10]
+    lines = [
+        f"CONTEXT for admission {session_id} (~{when}) — what else was on record "
+        f"in the admission(s) where {anchor_name} appears:"
+    ]
+    if asserted:
+        lines.append("  present: " + ", ".join(f"{r['name']} ({r['label']})" for r in asserted))
+    if negated:
+        lines.append("  ruled out: " + ", ".join(f"{r['name']} ({r['label']})" for r in negated))
+    return RetrieveItem(
+        text="\n".join(lines), session_id=session_id, turn_ids=[], score=0.95, channel="graph"
+    )
+
+
+def _timeline_to_item(
+    entity_name: str, label: str, claims: list[dict], client: HydraClient
+) -> RetrieveItem | None:
+    """One entity's whole history rendered as a single evidence item.
+
+    Deliberately ONE item, not one per claim: the point is that the reader sees
+    the sequence together and can order it. Splitting it would put the claims
+    back into competition with each other for top-k slots, which is the problem
+    this is solving.
+
+    `channel` stays `"graph"`. `contracts.Channel` is a frozen three-value
+    Literal and widening it is a decisions/ file, not a quiet edit here."""
+    if not claims:
+        return None
+    lines = [f"TIMELINE for {label}({entity_name}) — all {len(claims)} claim(s) on record, oldest first:"]
+    turn_ids: list[int] = []
+    session_id = ""
+    for c in claims:
+        quote, tids, sid = _turn_text_for_claim(client, c["id"])
+        turn_ids.extend(tids)
+        session_id = session_id or sid or str(c.get("session_id") or "")
+        when = str(c.get("valid_from") or "?")
+        state = "ongoing" if c.get("valid_to") == SENTINEL_VALID_TO else f"until {c.get('valid_to')}"
+        line = (
+            f"  [{when}] {c.get('predicate')} {c.get('polarity')} "
+            f"({c.get('status')}, {state}, admission {c.get('session_id')})"
+        )
+        if quote:
+            line += f' — "{quote[:220]}"'
+        lines.append(line)
+    return RetrieveItem(
+        text="\n".join(lines),
+        session_id=session_id,
+        turn_ids=turn_ids[:24],
+        score=1.0,
+        channel="graph",
+    )
+
+
 def _path_to_item(path: traverse.Path) -> RetrieveItem:
     """One `algo.MSpaths` path rendered as a `RetrieveItem` for fusion.
     `turn_ids` is deliberately `[]`: `:Claim` nodes do not carry a
@@ -493,7 +708,107 @@ def _graph_channel(
     with span("rerank", kind="RERANKER", candidate_count=len(all_paths)) as sp:
         ranked = traverse.rank_paths(all_paths, as_of=as_of)
     items = [_path_to_item(p) for p in ranked]
-    return items, ranked, False
+
+    # Timelines FIRST. Path items answer "what is connected to what"; a timeline
+    # answers "what happened to this thing, in what order" — which is the actual
+    # question in every cross-admission and longitudinal item on this benchmark.
+    # They lead the list so they survive the final top-k slice in _retrieve_impl.
+    timeline_items = _timeline_items(client, patient_node_id, by_label)
+    return timeline_items + items, ranked, False
+
+
+
+def _timeline_items(
+    client: HydraClient, patient_node_id: int, by_label: dict[str, list[int]]
+) -> list[RetrieveItem]:
+    """Build timelines for the top seeded entities, cheapest-first.
+
+    Bounded by `DEFAULT_TIMELINE_ENTITIES` because each timeline costs one
+    ordered query plus one turn lookup per claim. Failure of any single timeline
+    is swallowed: a missing timeline degrades this back to the previous
+    path-only behaviour, which is worse but not broken."""
+    entities = _entity_names(client, patient_node_id)
+    out: list[RetrieveItem] = []
+    anchors: dict[str, list[str]] = {}
+    for label, ids in by_label.items():
+        if len(out) >= DEFAULT_TIMELINE_ENTITIES:
+            break
+        for entity_id in ids:
+            # `break`, not `return` — returning here skipped the co-occurrence
+            # step below entirely, and since the cap is hit on essentially every
+            # real question, the context items were never emitted at all.
+            if len(out) >= DEFAULT_TIMELINE_ENTITIES:
+                break
+            name = entities.get(entity_id)
+            if not name:
+                continue
+            try:
+                claims = entity_timeline(client, _patient_id_of(client, patient_node_id), entity_id, label)
+                item = _timeline_to_item(name, label, claims, client)
+            except Exception as exc:  # noqa: BLE001 — one timeline must not sink a query
+                # WARN, don't swallow. A bare `continue` here hid a NameError on
+                # the very first run of this code: every timeline died and the
+                # channel silently degraded to the old path-only behaviour,
+                # which looks exactly like "the feature is on but didn't help".
+                warnings.warn(
+                    f"timeline failed for {label}({name}): {type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
+            if item is not None:
+                out.append(item)
+                anchors.setdefault(name, []).extend(
+                    str(c.get("session_id")) for c in claims if c.get("session_id")
+                )
+    out.extend(_context_items(client, _patient_id_of(client, patient_node_id), anchors))
+    return out
+
+
+def _context_items(
+    client: HydraClient, patient_id: str, anchors: dict[str, list[str]]
+) -> list[RetrieveItem]:
+    """Co-occurrence context for the admissions the timelines landed in.
+
+    Bounded by `MAX_CONTEXT_ADMISSIONS`: a symptom that recurs across a dozen
+    admissions would otherwise pull the whole record back in, which is the
+    behaviour this system exists to avoid."""
+    seen: set[str] = set()
+    items: list[RetrieveItem] = []
+    for anchor_name, sessions in anchors.items():
+        for session_id in sessions:
+            if session_id in seen or len(items) >= MAX_CONTEXT_ADMISSIONS:
+                continue
+            seen.add(session_id)
+            rows = admission_context(client, patient_id, session_id)
+            item = _context_item(session_id, rows, anchor_name)
+            if item is not None:
+                items.append(item)
+    return items
+
+
+def _entity_names(client: HydraClient, patient_node_id: int) -> dict[int, str]:
+    """`node_id -> name` for this patient's entities, off the same cached fetch
+    `seed_entity_ids` uses, so this adds no queries."""
+    return {eid: name for eid, name, _label in _fetch_patient_entities(client, patient_node_id)}
+
+
+_PATIENT_ID_CACHE: dict[int, str] = {}
+
+
+def _patient_id_of(client: HydraClient, patient_node_id: int) -> str:
+    """The string `patient_id` for a minted node id. `:Claim.patient_id` stores
+    the string form, and the timeline query keys on it to avoid the `:Patient`
+    hub."""
+    cached = _PATIENT_ID_CACHE.get(patient_node_id)
+    if cached is not None:
+        return cached
+    rows = client.run(
+        "MATCH (p:Patient {id: $pid}) RETURN p.patient_id AS patient_id", pid=patient_node_id
+    )
+    value = str(rows[0]["patient_id"]) if rows else ""
+    _PATIENT_ID_CACHE[patient_node_id] = value
+    return value
 
 
 def _patient_exists(client: HydraClient, patient_node_id: int) -> bool:

@@ -26,7 +26,7 @@ from medmemgraph.contracts import RetrieveItem, RetrieveResult
 from medmemgraph.graph import fusion, retrieve as retrieve_mod, router
 from medmemgraph.graph.lexical import LexicalIndex
 from medmemgraph.graph.vector_index import PatientIndex
-from medmemgraph.hydra_client import HydraClient
+from medmemgraph.hydra_client import validate_dialect, HydraClient
 from medmemgraph.pipeline.ids import mint_patient_id
 from medmemgraph.pipeline.loader import Admission, Conversation
 
@@ -524,3 +524,65 @@ def test_retrieve_for_eval_returns_the_frozen_contract_shape(registered_text_ind
     )
     assert isinstance(result, RetrieveResult)
     assert result.route in ("graph", "vector", "hybrid")
+
+
+class TestEntityTimeline:
+    """`entity_timeline` — complete, chronological coverage of one entity.
+
+    The query top-k similarity structurally cannot express. Observed failure it
+    fixes: asked to compare the etiology of headache between two dates,
+    retrieval returned 6 items from 3 sessions and none were headache claims,
+    while the graph held exactly three headache claims at the dates asked
+    about."""
+
+    def test_rejects_a_non_entity_label(self):
+        """Label is interpolated into the query string (it cannot be a
+        parameter in a node pattern), so it must be validated against the closed
+        vocabulary or it is an injection point."""
+        with pytest.raises(ValueError, match="not a domain entity label"):
+            retrieve_mod.entity_timeline(object(), "p1", 123, "Claim")
+
+    def test_label_injection_is_refused(self):
+        with pytest.raises(ValueError):
+            retrieve_mod.entity_timeline(object(), "p1", 123, "Symptom) RETURN 1 //")
+
+    def test_query_is_dialect_legal(self):
+        """Every node pattern labelled, relationship directed, no IN/IS NULL/
+        CASE — the shapes `hydra_client.validate_dialect` rejects."""
+        captured = {}
+
+        class _FakeClient:
+            def run(self, cypher, **params):
+                captured["cypher"] = cypher
+                captured["params"] = params
+                return []
+
+        retrieve_mod.entity_timeline(_FakeClient(), "10213338", 42, "Symptom")
+        cypher = captured["cypher"]
+        validate_dialect(cypher)  # must not raise
+        assert "ORDER BY cl.valid_from" in cypher
+        assert "(cl:Claim" in cypher and "(e:Symptom" in cypher
+        assert captured["params"] == {"pid": "10213338", "eid": 42}
+
+    def test_keys_on_claim_patient_id_not_the_patient_hub(self):
+        """Walking (:Patient)-[:HAS]-> is what made algo.MSpaths exceed the
+        engine's 30s timeout — :Patient has an edge to every claim. A property
+        lookup on the claim sidesteps the hub."""
+        captured = {}
+
+        class _FakeClient:
+            def run(self, cypher, **params):
+                captured["cypher"] = cypher
+                return []
+
+        retrieve_mod.entity_timeline(_FakeClient(), "p", 1, "Medication")
+        assert ":HAS" not in captured["cypher"]
+        assert "patient_id: $pid" in captured["cypher"]
+
+    def test_result_is_capped(self):
+        class _FakeClient:
+            def run(self, cypher, **params):
+                return [{"id": i, "valid_from": f"210{i}-01-01"} for i in range(50)]
+
+        rows = retrieve_mod.entity_timeline(_FakeClient(), "p", 1, "Symptom", limit=5)
+        assert len(rows) == 5

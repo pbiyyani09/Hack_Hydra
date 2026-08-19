@@ -149,11 +149,54 @@ the mitigation is documented on the judge side."""
 
 _VALID_MODES = frozenset({"direct", "chain_of_note"})
 _VALID_RENDERINGS = frozenset({"json", "prose", "shuffled"})
-_READER_MAX_TOKENS = 700
+_READER_MAX_TOKENS = 2500
 """Chain-of-Note needs room for one note per retrieved item plus the
 reasoning/answer — bigger than judge.py's 300-token budget (a single
-correct/reason verdict)."""
+correct/reason verdict).
+
+Raised 700 -> 2500 on 2026-08-19. One realistic note object measures ~44 tokens,
+so 700 fit only ~14 notes before the answer text was squeezed out — which
+silently capped the usable evidence budget at k~14 no matter what `k` was set
+to. Past that, `llm.py` detects truncation and escalates max_tokens x4
+(`_next_truncation_max_tokens`), so the run still completed but paid an extra
+round trip per item. 2500 covers ~50 notes plus an answer without escalating."""
 _DEFAULT_SHUFFLE_SEED = 0
+
+
+@dataclass(frozen=True)
+class EvidenceProvenance:
+    """What the retrieved evidence was drawn FROM — the denominator the reader
+    otherwise never sees. All fields optional; a caller that cannot cheaply
+    compute one passes None rather than guessing."""
+
+    total_units: int | None = None
+    n_admissions: int | None = None
+    first_time: str | None = None
+    last_time: str | None = None
+
+
+def _provenance_of(conversation: "Conversation | None") -> EvidenceProvenance | None:
+    """Summarize a `Conversation` into the denominator for `describe_evidence`.
+
+    Counts and date span ONLY — never turn text. This function is the one place
+    `ReaderAnswerer` touches the raw history, and it must stay incapable of
+    leaking content into the prompt, or the system stops being a retrieval
+    system and becomes full-context wearing its name."""
+    if conversation is None:
+        return None
+    try:
+        admissions = conversation.admissions
+        times = sorted(
+            t.time for adm in admissions for t in adm.turns() if getattr(t, "time", None)
+        )
+        return EvidenceProvenance(
+            total_units=sum(len(adm.conversation_lines) for adm in admissions),
+            n_admissions=len(admissions),
+            first_time=times[0] if times else None,
+            last_time=times[-1] if times else None,
+        )
+    except Exception:  # noqa: BLE001 — provenance is a nicety; never break an answer for it
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -161,18 +204,67 @@ _DEFAULT_SHUFFLE_SEED = 0
 # ---------------------------------------------------------------------------
 
 _LEADING_TIMESTAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}[^\]]*)\]\s*(.*)$", re.DOTALL)
+"""EHR-RAG's `[time] description` template (`literature/15` R-QCC-045) — a
+timestamp as the FIRST thing inside the bracket. Kept because it is the shape
+the literature describes, but note that NO producer in this project emits it;
+see `_TIMESTAMP_PATTERNS` for the ones that actually occur."""
+
+_TIMESTAMP_PATTERNS = (
+    # vector_index turn units:  "[admission 20971116 turn 14 · 2120-08-06 20:15:00 · Doctor] ..."
+    re.compile(r"^\[[^\]]*?·\s*(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?)\s*·[^\]]*\]\s*(.*)$", re.DOTALL),
+    # vector_index fact units:  "[fact <id> · admission <sid> · as of 2120-08-06T00:00:00] ..."
+    re.compile(r"^\[[^\]]*?as of\s*(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?)[^\]]*\]\s*(.*)$", re.DOTALL),
+    # graph path units:  "... Claim[REPORTS_SYMPTOM asserted, active, 2160-08-14T00:00:00..ongoing]"
+    re.compile(r"^(?P<head>.*?Claim\[[^\]]*?(?P<ts>\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?)?)\.\.[^\]]*\].*)$", re.DOTALL),
+)
+"""The timestamp shapes this project's three item producers ACTUALLY emit.
+
+Added 2026-08-19 after finding `_LEADING_TIMESTAMP_RE` matched none of them.
+That regex requires the date to be the first characters inside the bracket;
+every real item puts an admission id, a fact id, or a whole path expression
+first. The consequence was that `time` was rendered `null` on EVERY evidence
+item, and prose rendering printed "time unknown" — while the dates sat in plain
+sight inside `text`, unlabelled.
+
+This was not cosmetic. The three question categories this system loses to the
+full-context baseline (`cross_admission_comparison`, `longitudinal_progression`,
+`frequency_pattern`) are precisely the ones that need to order and compare
+events in time, and the reader was being handed a field explicitly telling it
+no timestamp was available. `fullctx`, by contrast, states "oldest first" in its
+own prompt and gets the whole history in order.
+
+Order matters: the turn pattern is tried first because it is the most common
+unit, and the `as of` pattern before the graph one because a fact unit's bracket
+can also contain a `..` interval."""
 
 
 def _split_timestamp(text: str) -> tuple[str | None, str]:
-    """Best-effort split of a leading bracketed timestamp off an item's raw
-    text (EHR-RAG's `[time] type - description (value: value)` template,
-    `literature/15` R-QCC-045) into `(time, remaining_text)`. Returns
-    `(None, text)` when no such prefix is present — an absent timestamp is
-    rendered as "unknown", never invented."""
-    match = _LEADING_TIMESTAMP_RE.match(text.strip())
-    if not match:
-        return None, text
-    return match.group(1).strip(), match.group(2).strip()
+    """Best-effort split of a timestamp off an item's raw text into
+    `(time, remaining_text)`.
+
+    Tries the EHR-RAG leading-bracket template first (`literature/15`
+    R-QCC-045), then the shapes this project's own producers emit
+    (`_TIMESTAMP_PATTERNS`). Returns `(None, text)` when nothing matches — an
+    absent timestamp is rendered as "unknown", never invented.
+
+    For graph path items the text is returned UNCHANGED alongside the extracted
+    time: the timestamp is embedded mid-expression (`Claim[... 2160-08-14..ongoing]`)
+    rather than being a strippable prefix, and cutting it out would mangle the
+    path rendering the reader needs to read."""
+    stripped = text.strip()
+    match = _LEADING_TIMESTAMP_RE.match(stripped)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+
+    for pattern in _TIMESTAMP_PATTERNS:
+        match = pattern.match(stripped)
+        if not match:
+            continue
+        if "ts" in (match.groupdict() or {}):
+            # Graph path: keep the whole expression, just surface the time.
+            return match.group("ts").strip(), stripped
+        return match.group(1).strip(), match.group(2).strip()
+    return None, text
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +379,18 @@ _CON_SYSTEM = (
     'evidence), respond with the literal string "NOT_IN_RECORD" as the '
     "answer and set abstained=true. Never state a session id or turn id "
     "that was not given to you in the evidence below.\n"
+    "The EVIDENCE PROVENANCE line above the evidence states how many items you "
+    "were given, what they were selected from, and in what order. Read it. Your "
+    "evidence is a SELECTION, not the patient's complete record, and it is "
+    "ordered by retrieval relevance rather than by time.\n"
+    "Two consequences you must respect. (a) TIME: each item carries a time "
+    "field where one is known -- order events by that field, never by the order "
+    "the items happen to appear in. (b) COMPLETENESS: if the question asks "
+    "which thing was most frequent, most consistent, or most common, or how "
+    "something was distributed across admissions, that is a question about the "
+    "WHOLE record. Answer it only if your evidence plainly covers the whole "
+    "span; otherwise say what the evidence does show and state that it is a "
+    "selection. Do not generalise a count from a sample.\n"
     "Respond with the required JSON only: one note object per evidence "
     "item, in the same order, then the answer, then abstained."
 )
@@ -326,10 +430,65 @@ _CON_SCHEMA = {
 }
 
 
-def _build_user_content(
-    question: str, context_text: str, structural_absence: bool, rendering: str
+def describe_evidence(
+    items: list[RetrieveItem], rendering: str, *, corpus: EvidenceProvenance | None = None
 ) -> str:
+    """One line telling the reader what its evidence actually IS.
+
+    Before this existed the reader was told the opposite of the truth. The
+    system prompt says the evidence is "already selected for this question, from
+    this patient's record", and nothing anywhere said it was a top-k SAMPLE.
+    Meanwhile `eval/baselines/fullctx.py` tells its model it has "FULL access ...
+    spanning every hospital admission on record" and that the history is "oldest
+    first".
+
+    That asymmetry is not cosmetic on this benchmark. "Which symptom was most
+    consistently reported?" is unanswerable in principle from 6 of ~2,000 units,
+    and a model that has not been told its evidence is a sample will answer it
+    confidently anyway — which is exactly the judge feedback on our
+    `frequency_pattern` losses ("stated fever was the most consistently reported
+    symptom while the gold reference stated ...").
+
+    Stating the sampling honestly does not make those items answerable. It lets
+    the model distinguish "the evidence says X" from "the evidence I was given
+    happens to contain X", which is the difference between a wrong answer and a
+    correct abstention."""
+    ordering = (
+        "shuffled for reading (the Item N ordinal is still retrieval rank)"
+        if rendering == "shuffled"
+        else "ordered by retrieval relevance, NOT chronologically"
+    )
+    parts = [f"{len(items)} evidence item(s), {ordering}"]
+    if corpus is not None:
+        if corpus.total_units:
+            parts.append(f"selected from ~{corpus.total_units} units in the record")
+        if corpus.n_admissions:
+            span = ""
+            if corpus.first_time and corpus.last_time:
+                span = f" spanning {corpus.first_time[:10]} to {corpus.last_time[:10]}"
+            parts.append(f"across {corpus.n_admissions} admission(s){span}")
+    tail = ""
+    if corpus is not None and corpus.n_admissions:
+        sessions = len({i.session_id for i in items if i.session_id})
+        if sessions:
+            tail = f"; these items touch {sessions} of those {corpus.n_admissions} admissions"
+    return "EVIDENCE PROVENANCE: " + ", ".join(parts) + tail + "."
+
+
+def _build_user_content(
+    question: str,
+    context_text: str,
+    structural_absence: bool,
+    rendering: str,
+    *,
+    items: list[RetrieveItem] | None = None,
+    corpus: EvidenceProvenance | None = None,
+) -> str:
+    provenance = ""
+    if items is not None:
+        provenance = describe_evidence(items, rendering, corpus=corpus) + "\n\n"
     return (
+        f"{provenance}"
         f"RETRIEVED EVIDENCE ({rendering} rendering):\n{context_text}\n\n"
         f"STRUCTURAL_ABSENCE: {structural_absence}\n"
         f"QUESTION: {question}"
@@ -571,6 +730,7 @@ def read(
     rng: random.Random | None = None,
     guardrail_enabled: bool = False,
     guardrail_policy: str = "warn",
+    corpus: EvidenceProvenance | None = None,
 ) -> Answer:
     """Answer `question` over already-retrieved `items`. Never retrieves —
     this function never calls the graph/vector retriever or the corpus
@@ -618,7 +778,9 @@ def read(
 
     context_text = render_context(items, rendering, rng=rng)
     system_prompt = _CON_SYSTEM if mode == "chain_of_note" else _DIRECT_SYSTEM
-    user_content = _build_user_content(question, context_text, structural_absence, rendering)
+    user_content = _build_user_content(
+        question, context_text, structural_absence, rendering, items=items, corpus=corpus
+    )
     schema = _CON_SCHEMA if mode == "chain_of_note" else _DIRECT_SCHEMA
 
     if dry_run:
@@ -798,7 +960,12 @@ class ReaderAnswerer:
         scope: str | None = None,
         question_type: str | None = None,
     ) -> AnswerResult:
-        del conversation  # this system answers over *retrieved* evidence, not raw turn history
+        # `conversation` is NOT used as evidence — this system answers over
+        # retrieved items, and reading raw turns here would quietly turn it into
+        # a full-context baseline. It is used only to describe what the evidence
+        # was drawn from (how many admissions, over what span), which is the
+        # denominator the reader otherwise never sees. See `describe_evidence`.
+        corpus = _provenance_of(conversation)
         pack = self._retrieve(question, patient_id, scope=scope, question_type=question_type)
         result = read(
             question,
@@ -810,6 +977,7 @@ class ReaderAnswerer:
             dry_run=self.dry_run,
             guardrail_enabled=self.guardrail_enabled,
             guardrail_policy=self.guardrail_policy,
+            corpus=corpus,
         )
         return AnswerResult(
             text=result.text,

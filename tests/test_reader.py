@@ -34,6 +34,7 @@ from medmemgraph.eval.reader import (
     ReaderChainOfNoteAnswerer,
     ReaderDirectAnswerer,
     _default_retriever,
+    _split_timestamp,
     read,
     render_context,
 )
@@ -600,3 +601,75 @@ class TestEvalPathAlwaysPinsEpsilonZero:
         retriever("does the patient have any allergies?", "some-patient", 3)
 
         assert seen_epsilons == [0.0]
+
+
+class TestTimestampExtractionMatchesRealProducers:
+    """`_split_timestamp` against the text this project's item producers
+    ACTUALLY emit.
+
+    Regression for a bug found 2026-08-19: `_LEADING_TIMESTAMP_RE` requires the
+    date to be the first characters inside the bracket, and NO producer emits
+    that shape — turn units lead with an admission id, fact units with a fact
+    id, graph units with a whole path expression. So `time` rendered as `null`
+    on every evidence item and prose printed "time unknown", while the dates sat
+    inside `text` unlabelled.
+
+    That mattered because the three categories this system loses on
+    (cross_admission_comparison, longitudinal_progression, frequency_pattern)
+    are exactly the ones that need to order events in time — the reader was
+    being told no timestamp existed."""
+
+    def test_turn_unit_from_vector_index(self):
+        # Exact format of graph/vector_index.py's turn unit.
+        text = "[admission 20971116 turn 14 · 2120-08-06 20:15:00 · Doctor] We are adding spironolactone."
+        time_, body = _split_timestamp(text)
+        assert time_ == "2120-08-06 20:15:00"
+        assert body == "We are adding spironolactone."
+
+    def test_fact_unit_from_vector_index(self):
+        text = "[fact abc123 · admission 20971116 · as of 2120-08-06T00:00:00] TAKES_MEDICATION furosemide"
+        time_, body = _split_timestamp(text)
+        assert time_ == "2120-08-06T00:00:00"
+        assert body == "TAKES_MEDICATION furosemide"
+
+    def test_graph_path_unit_keeps_its_text_intact(self):
+        """A graph path's timestamp is embedded mid-expression, not a strippable
+        prefix — surface the time but do not mangle the path."""
+        text = "Symptom(headaches) <-[ABOUT]- Claim[REPORTS_SYMPTOM asserted, active, 2160-08-14T00:00:00..ongoing]"
+        time_, body = _split_timestamp(text)
+        assert time_ == "2160-08-14T00:00:00"
+        assert body == text, "graph path text must survive unchanged"
+
+    def test_legacy_ehr_rag_shape_still_works(self):
+        """literature/15 R-QCC-045's template — kept working even though no
+        producer here emits it."""
+        time_, body = _split_timestamp("[2120-08-06 20:15:00] legacy shape")
+        assert time_ == "2120-08-06 20:15:00"
+        assert body == "legacy shape"
+
+    def test_absent_timestamp_is_none_not_invented(self):
+        time_, body = _split_timestamp("no timestamp anywhere in this text")
+        assert time_ is None
+        assert body == "no timestamp anywhere in this text"
+
+    def test_rendered_json_carries_a_non_null_time(self):
+        """The end-to-end symptom: what the model actually sees."""
+        items = [
+            RetrieveItem(
+                text="[admission 20971116 turn 14 · 2120-08-06 20:15:00 · Doctor] Dose raised.",
+                session_id="20971116", turn_ids=[14], score=0.9, channel="vector",
+            )
+        ]
+        payload = json.loads(render_context(items, "json"))
+        assert payload[0]["time"] == "2120-08-06 20:15:00", (
+            "the reader must see a real timestamp, not null"
+        )
+
+    def test_rendered_prose_does_not_say_time_unknown(self):
+        items = [
+            RetrieveItem(
+                text="[admission 20971116 turn 14 · 2120-08-06 20:15:00 · Doctor] Dose raised.",
+                session_id="20971116", turn_ids=[14], score=0.9, channel="vector",
+            )
+        ]
+        assert "time unknown" not in render_context(items, "prose")

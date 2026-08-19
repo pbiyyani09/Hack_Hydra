@@ -693,7 +693,17 @@ def _render_node(node: GraphNode) -> str:
         status = props.get("status", "?")
         valid_from = props.get("valid_from", "?")
         valid_to = props.get("valid_to", "?")
-        interval = "ongoing" if valid_to == SENTINEL_VALID_TO else f"{valid_from}..{valid_to}"
+        # An open interval still has a START, and the start is the temporally
+        # informative half. Rendering a live claim as bare "ongoing" threw
+        # `valid_from` away entirely, so every ACTIVE claim reached the reader
+        # with no date at all — on a benchmark whose hardest categories are
+        # cross-admission comparison and longitudinal progression. Found
+        # 2026-08-19 when 11 of 25 evidence items came back with time=null and
+        # every one of them was a live graph claim.
+        if valid_to == SENTINEL_VALID_TO:
+            interval = f"{valid_from}..ongoing" if valid_from and valid_from != "?" else "ongoing"
+        else:
+            interval = f"{valid_from}..{valid_to}"
         confidence = props.get("confidence")
         conf_suffix = f", conf={confidence:.2f}" if isinstance(confidence, (int, float)) else ""
         return f"Claim[{predicate} {polarity}, {status}, {interval}{conf_suffix}]"

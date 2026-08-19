@@ -31,6 +31,12 @@ RESULTS_DIR="${RESULTS_DIR:-results}"
 # real retrieval. Run them as their own A/B:
 #   SYSTEMS="reader_direct reader_con" RESULTS_DIR=results/reading-ablation ./scripts/run_eval.sh
 SYSTEMS="${SYSTEMS:-nomem fullctx dense lexical medmemgraph}"
+# Evidence items handed to the reader. The recorded 0.641 run used the k=6
+# default, which on a patient with 27 admissions is 6 items covering 6 of them —
+# while the full-context baseline sees all 27. Nothing else caps the reader:
+# 25 items is ~3k prompt tokens, still ~26x cheaper than fullctx's ~80k.
+# `nomem`/`fullctx` ignore this flag (no `k` in their constructors).
+RETRIEVE_K="${RETRIEVE_K:-25}"
 
 export MEDMEMGRAPH_LLM_CACHE_DIR="${MEDMEMGRAPH_LLM_CACHE_DIR:-$PWD/data/llm_cache}"
 
@@ -57,6 +63,7 @@ for patient in $patients; do
       --system "$system" \
       --stratify-per-type "$PER_TYPE" \
       --seed "$SEED" \
+      --retrieve-k "$RETRIEVE_K" \
       --results-dir "$RESULTS_DIR" \
       >/dev/null || echo "    FAILED $patient/$system" >&2
   done
