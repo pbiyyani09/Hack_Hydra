@@ -116,6 +116,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Callable, Literal, MutableMapping, Sequence
 
+from medmemgraph import llm
 from medmemgraph.contracts import ClinicalFact
 from medmemgraph.pipeline.ids import IdMap, IdMinter, mint_entity_id, mint_patient_id, normalize_key
 
@@ -518,29 +519,46 @@ def _match_user_prompt(a: Mention, b: Mention) -> str:
     )
 
 
+MATCH_MODEL = os.environ.get("MEDMEMGRAPH_MATCH_MODEL", llm.EXTRACT_MODEL)
+"""Entity-resolution adjudicator. Defaults to `llm.EXTRACT_MODEL` (the cheap
+Google tier) — this is a high-volume, low-difficulty yes/no judgement, and
+`match()` short-circuits on exact key and caches by normalized name pair, so
+real calls are only the genuinely fuzzy candidates."""
+
+
 def _default_complete(system: str, user: str, schema: dict) -> dict:
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        raise MatchUnavailableError(
-            "no ANTHROPIC_API_KEY configured and no complete() override supplied"
+    """Route entity matching through `medmemgraph.llm`, the one seam every real
+    inference call in this project uses.
+
+    Rewired 2026-08-17. This function previously gated on `ANTHROPIC_API_KEY`
+    and then did `import anthropic` — but `anthropic` was removed from
+    `pyproject.toml` when the `llm.py` seam replaced it, so the import could
+    only ever have raised. In practice the key was never set, so `match()`
+    caught `MatchUnavailableError` and returned "no merge" for EVERY fuzzy pair:
+    entity resolution silently ran as blocking-key-exact-match only. That is
+    why a real corpus produced `shortness of breath` and `short of breath` as
+    two separate canonical entities, and why the E3-S1 headline case
+    (metformin / Glucophage / "the 500mg one") could never merge on real data.
+    """
+    try:
+        response = llm.complete(
+            user,
+            model=MATCH_MODEL,
+            schema=schema,
+            system=system,
+            max_tokens=_MATCH_MAX_TOKENS,
+            temperature=0.0,
         )
-    import anthropic
-
-    from medmemgraph.eval.types import supports_temperature
-
-    model = os.environ.get("MEDMEMGRAPH_MATCH_MODEL", "claude-haiku-4-5")
-    client = anthropic.Anthropic()
-    kwargs: dict = {
-        "model": model,
-        "max_tokens": _MATCH_MAX_TOKENS,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
-        "output_config": {"format": {"type": "json_schema", "schema": schema}},
-    }
-    if supports_temperature(model):
-        kwargs["temperature"] = 0
-    response = client.messages.create(**kwargs)
-    text = next((blk.text for blk in response.content if blk.type == "text"), "{}")
-    return json.loads(text)
+    except llm.LLMError as exc:
+        # Typed, so `match()` degrades to "no merge" for this pair rather than
+        # sinking the whole resolve() call — same contract as before, now with
+        # a real reason attached instead of a missing-key stub.
+        raise MatchUnavailableError(f"llm.complete failed for entity match: {exc}") from exc
+    if not isinstance(response.parsed, dict):
+        raise MatchUnavailableError(
+            f"entity-match response was not a JSON object: {response.parsed!r}"
+        )
+    return response.parsed
 
 
 def _pair_cache_key(a: Mention, b: Mention) -> tuple[str, str]:
@@ -625,7 +643,19 @@ def match(
 
 
 def _llm_configured(complete: Complete | None) -> bool:
-    return complete is not None or bool(os.environ.get("ANTHROPIC_API_KEY"))
+    """Is a real adjudicator reachable? An injected `complete` always counts;
+    otherwise the default path needs whichever provider key `MATCH_MODEL` routes
+    to. Checked by resolving the key, not by probing one hardcoded env var name
+    — `llm.py` accepts four spellings across two providers and also reads `.env`,
+    so an env-var membership test gave false negatives and warned about degrading
+    on runs that were about to work fine."""
+    if complete is not None:
+        return True
+    try:
+        llm.resolve_key_for_model(MATCH_MODEL)
+    except llm.LLMError:
+        return False
+    return True
 
 
 def resolve(
@@ -680,9 +710,12 @@ def resolve(
     """
     if not _llm_configured(complete):
         logger.warning(
-            "pipeline.resolve: no ANTHROPIC_API_KEY configured and no complete() "
-            "override supplied — degrading to blocking-key-exact-match only; "
-            "fuzzy (non-exact-key) candidates will NOT be merged this run"
+            "pipeline.resolve: no API key resolvable for MATCH_MODEL=%s and no "
+            "complete() override supplied — degrading to blocking-key-exact-match "
+            "only; fuzzy (non-exact-key) candidates will NOT be merged this run, so "
+            "surface variants of one entity ('shortness of breath' / 'short of "
+            "breath') will become separate canonical nodes",
+            MATCH_MODEL,
         )
 
     by_patient_existing: dict[str, list[CanonicalEntity]] = {}

@@ -281,3 +281,36 @@ def test_existence_fixture_both_directions_bolt() -> None:
         assert absent == []
     finally:
         client.close()
+
+
+class TestContainsRelationshipTypeVsStringOperator:
+    """`CONTAINS` is both a rejected string operator and a legal relationship
+    type in the frozen schema (`(:Admission)-[:CONTAINS]->(:Turn)`, §5.2).
+
+    Until 2026-08-17 the gate rejected both, so the schema declared an edge the
+    only available client refused to send — discovered when the `:Turn`
+    provenance layer first tried to write it."""
+
+    def test_contains_relationship_type_is_allowed(self) -> None:
+        validate_dialect(
+            "UNWIND $rows AS row "
+            "MATCH (s:Admission {id: row.source_vertex}), (d:Turn {id: row.destination_vertex}) "
+            "MERGE (s)-[r:CONTAINS {id: row.relationship_vertex}]->(d) "
+            "SET r.observed_at = row.observed_at"
+        )
+
+    def test_contains_relationship_type_with_a_space_after_the_colon_is_allowed(self) -> None:
+        validate_dialect(
+            "MATCH (s:Admission {id: $sid})-[r: CONTAINS]->(d:Turn {id: $did}) RETURN r.observed_at AS o"
+        )
+
+    def test_contains_read_traversal_is_allowed(self) -> None:
+        validate_dialect("MATCH (a:Admission {id: $aid})-[:CONTAINS]->(t:Turn) RETURN t.raw_text AS raw_text")
+
+    def test_contains_as_a_string_operator_is_still_rejected(self) -> None:
+        with pytest.raises(DialectError, match="CONTAINS"):
+            validate_dialect("MATCH (n:Turn {id: $id}) WHERE n.raw_text CONTAINS $needle RETURN n.id AS id")
+
+    def test_ends_with_is_still_rejected(self) -> None:
+        with pytest.raises(DialectError, match="ENDS WITH"):
+            validate_dialect("MATCH (n:Turn {id: $id}) WHERE n.raw_text ENDS WITH $suffix RETURN n.id AS id")

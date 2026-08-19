@@ -134,7 +134,9 @@ def _hashing_embed(texts: list[str], dim: int = DEFAULT_EMBED_DIM) -> np.ndarray
     return (vectors / norms).astype(np.float32)
 
 
-def embed_texts(texts: list[str], *, dim: int = DEFAULT_EMBED_DIM) -> np.ndarray:
+def embed_texts(
+    texts: list[str], *, dim: int = DEFAULT_EMBED_DIM, is_query: bool = False
+) -> np.ndarray:
     """`(len(texts), dim)` L2-normalized float32 array — the frozen
     `E4-S2` `embed()` contract. Prefers the real Graph-owned
     `medmemgraph.embeddings.embed` if it has landed (same
@@ -147,11 +149,43 @@ def embed_texts(texts: list[str], *, dim: int = DEFAULT_EMBED_DIM) -> np.ndarray
     already documents)."""
     if not texts:
         return np.zeros((0, dim), dtype=np.float32)
-    try:
-        from medmemgraph.embeddings import embed as _real_embed
 
-        return _real_embed(texts)
-    except ImportError:
+    # Prefer the SAME real encoder the dense index uses. Until 2026-08-17 this
+    # tried `medmemgraph.embeddings`, a module that was specced but never
+    # written, so the `ImportError` fired every time and EVERY caller silently
+    # got the hashing trick.
+    #
+    # That mattered far more than "slightly worse similarity". The only
+    # production caller is `graph/retrieve.py::seed_entity_ids`, which picks
+    # WHICH of a patient's entities to seed the `algo.MSpaths` walk from by
+    # cosine against the question. A hashing trick has zero semantic knowledge
+    # by construction, so that choice was effectively arbitrary among the
+    # patient's hundreds of entities — the graph arm, this project's entire
+    # differentiator, was seeding from noise. Observed directly in the first
+    # eval run: longitudinal questions came back fluent and confidently wrong,
+    # naming a plausible but unrelated condition from the same patient
+    # ("atelectasis" for "painful respiration", "C. difficile" for "ulcerative
+    # colitis").
+    #
+    # `is_query` selects the model's query-side prompt. Qwen3-Embedding (and
+    # most modern retrieval backbones) are trained ASYMMETRICALLY: the query
+    # gets an instruction prefix, the documents do not. Encoding both sides
+    # identically throws away the training signal and leaves scores bunched
+    # together, which is fatal here because seeding is a top-k over short
+    # entity names where the margins are already thin.
+    #
+    # `dim` is ignored on this path: the real backbone's dimensionality is its
+    # own, and every consumer here compares vectors produced by the same call,
+    # so only internal consistency matters.
+    try:
+        from medmemgraph.graph import embedders
+
+        backend = embedders.get_backend(embedders.DEFAULT_BACKEND_NAME)
+        return np.asarray(backend.encode(list(texts), is_query=is_query), dtype=np.float32)
+    except Exception:  # noqa: BLE001 — the fallback must never be able to fail
+        # Model unavailable (no weights cached, no network, OOM). Degrade to the
+        # deterministic hashing trick rather than failing retrieval outright —
+        # but note this is a real quality cliff, not an equivalent path.
         return _hashing_embed(texts, dim=dim)
 
 

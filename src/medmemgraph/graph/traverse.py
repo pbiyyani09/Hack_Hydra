@@ -159,13 +159,38 @@ MAX_HOPS = 16
 `src/core/config.rs:45`'s `max_traversal_hops: 16`). `paths_between` clamps
 to this and warns rather than letting the engine reject the request live."""
 
-DEFAULT_REL_TYPES: tuple[str, ...] = ("HAS", "ABOUT", "SUPERSEDES", "CONTRADICTS")
+DEFAULT_REL_TYPES: tuple[str, ...] = ("ABOUT", "SUPERSEDES", "CONTRADICTS")
 """ARCHITECTURE §7.3's own example set, minus `DRAWN_FROM`/`ADMITTED`/
-`CONTAINS`: `:Turn` nodes and `DRAWN_FROM` edges are not written by
-`graph/writer.py` (out of scope there — see its module docstring), and
-`ADMITTED`/`CONTAINS` walk the Patient->Admission->Turn substructure, not
-the claim/entity substructure this module's callers traverse. Pass
-`rel_types=` explicitly to widen or narrow this."""
+`CONTAINS` — `ADMITTED`/`CONTAINS` walk the Patient->Admission->Turn
+substructure, not the claim/entity substructure this module's callers traverse
+— and minus `HAS`.
+
+**`HAS` (Patient -> Claim) is excluded as a correctness requirement at corpus
+scale, not a tuning preference.**
+
+`:Patient` is a hub: one node with an edge to every claim that patient has (586
+for subject 10056223; ~900 for the largest patient in the 20-patient run).
+Including `HAS` lets a walk reach that hub and fan back out across every claim,
+so cost explodes with depth. Measured against the real graph, 2026-08-18:
+
+    with `HAS`    : max_len 2-3 -> ~1.5s; max_len >= 4 -> the engine KILLS the
+                    query ("native_path_neighbors exceeded query timeout after
+                    29999 ms; limit is 29999 ms")
+    without `HAS` : max_len 8   -> ~1.2s
+
+`retrieve.DEFAULT_GRAPH_MAX_HOPS` is 8, so with `HAS` every graph-routed
+question against a real patient timed out. And the failure was INVISIBLE:
+`graph/retrieve.py` catches broadly and degrades to the text arm, so those
+questions were silently answered from vector/lexical evidence.
+
+Excluding `HAS` costs nothing semantically. Seeds are already patient-scoped
+(`retrieve._fetch_patient_entities` only ever fetches that one patient's
+entities), so a hub-mediated path asserts co-patient-hood that is already
+guaranteed by construction. Every informative shape survives —
+`Entity <-ABOUT- Claim`, `Claim -SUPERSEDES-> Claim`,
+`Claim -CONTRADICTS-> Claim` — and observed real paths are 1-2 hops.
+
+Pass `rel_types=` explicitly to widen or narrow this."""
 
 DEFAULT_GAMMA = 0.85
 """Hop-decay constant for `rank_paths`'s heuristic scorer

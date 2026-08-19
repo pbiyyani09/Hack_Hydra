@@ -234,7 +234,7 @@ def test_retrieve_returns_the_frozen_contract_shape(registered_text_indexes: str
     assert result.route in ("graph", "vector", "hybrid")
     assert isinstance(result.structural_absence, bool)
     assert isinstance(result.paths, list)
-    assert set(result.latency_ms) == {"search", "total", "graph", "vector", "lexical"}
+    assert set(result.latency_ms) == {"search", "total", "graph", "vector", "lexical", "rerank"}
     assert all(isinstance(v, (int, float)) for v in result.latency_ms.values())
     assert result.latency_ms["total"] >= 0.0
 
@@ -474,7 +474,7 @@ def test_retrieve_latency_ms_is_populated_on_the_live_graph_path(client: HydraCl
         epsilon=0.0,
         client=client,
     )
-    assert set(result.latency_ms) == {"search", "total", "graph", "vector", "lexical"}
+    assert set(result.latency_ms) == {"search", "total", "graph", "vector", "lexical", "rerank"}
     assert result.latency_ms["total"] >= result.latency_ms["search"]
 
 

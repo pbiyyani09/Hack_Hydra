@@ -102,14 +102,27 @@ class TestGateBlocksWithNoPassed:
         with pytest.raises(ScaleGateError):
             assert_handcheck_passed(handcheck_dir=d)
 
-    def test_default_handcheck_dir_is_currently_blocked(self) -> None:
-        """No `handcheck_dir=` override — exercises the REAL default
-        directory (`fixtures/handcheck/`, which carries `PENDING`, not
-        `PASSED`, in this repo today — see that file's own contents). This
-        test only reads; it writes nothing, so it can never leak a
-        `PASSED` file."""
-        with pytest.raises(ScaleGateError, match="PASSED"):
-            assert_handcheck_passed()
+    def test_default_handcheck_dir_state_matches_whether_passed_exists(self) -> None:
+        """No `handcheck_dir=` override — exercises the REAL default directory
+        (`fixtures/handcheck/`).
+
+        Asserts the RULE, not a snapshot of the repo. The previous version of
+        this test asserted the default dir is always blocked, which was true
+        only while the repo shipped an unsigned gate; it started failing the
+        moment a human legitimately reviewed the checklist and wrote `PASSED`
+        (2026-08-17) — i.e. it failed on success. A gate test must track the
+        gate's logic, not one moment in the repo's history.
+
+        Read-only: this test never creates or removes `PASSED`. Only a human
+        may write it (E2-S3 "Banned approaches")."""
+        from medmemgraph.pipeline.scale_gate import DEFAULT_HANDCHECK_DIR
+
+        passed_exists = (DEFAULT_HANDCHECK_DIR / "PASSED").is_file()
+        if passed_exists:
+            assert_handcheck_passed()  # green gate must not raise
+        else:
+            with pytest.raises(ScaleGateError, match="PASSED"):
+                assert_handcheck_passed()
 
     def test_error_names_the_missing_path_and_next_step(self, tmp_path: Path) -> None:
         d = tmp_path / "handcheck"

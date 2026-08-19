@@ -137,6 +137,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import random
 import threading
 import time
@@ -186,6 +187,15 @@ class TruncationError(SchemaValidationError):
     they need different responses: a genuine schema violation means the
     schema (or the model) is wrong; a truncation means the request needs
     more headroom, not a different schema."""
+
+
+class LocalModelError(LLMError):
+    """A local (`local:`) model could not be loaded or run.
+
+    Raised by the memory pre-flight before any weight is read, and for bad
+    quantization settings. An `LLMError` subclass so existing `except LLMError`
+    handlers — `pipeline/resolve.py`'s entity-match degrade, for instance —
+    treat it like any other provider failure rather than crashing a run."""
 
 
 class ProviderError(LLMError):
@@ -351,10 +361,31 @@ EMBED_MODEL = os.environ.get("MEDMEMGRAPH_EMBED_MODEL", _HARDCODED_EMBED_MODEL)
 """OpenAI, text-embedding-3-small: cheapest embedding tier."""
 
 
+def resolve_key_for_model(model: str) -> str:
+    """The API key `model` would use, resolved the same way a real call resolves
+    it. Raises `LLMError` (`MissingAPIKeyError`, or a routing error for an
+    unroutable model name) if it is not configured.
+
+    Exists so a caller can answer "is real inference actually available?" without
+    probing one hardcoded env-var name. There are four accepted key spellings
+    across two providers and `.env` is also consulted, so an
+    `os.environ.get("SOME_KEY")` test gives false negatives — which is exactly
+    how `pipeline/resolve.py` ended up warning that it was degrading to
+    exact-match-only on runs that had perfectly good credentials.
+
+    Never returns the key in a log or an error message; only to the caller."""
+    provider = _provider_for_model(model)
+    if provider == "local":
+        return ""  # weights on disk; nothing to authenticate
+    return resolve_openai_key() if provider == "openai" else resolve_google_key()
+
+
 def _provider_for_model(model: str) -> str:
     """Route by model-name prefix: `gpt-`/`o<digit>`/`text-embedding-` ->
     "openai"; `gemini-`/`gemma-` -> "google"."""
     m = model.strip().lower()
+    if m.startswith(LOCAL_MODEL_PREFIX):
+        return "local"
     if m.startswith("gemini-") or m.startswith("gemma-"):
         return "google"
     if m.startswith("gpt-") or m.startswith("text-embedding") or (
@@ -363,8 +394,9 @@ def _provider_for_model(model: str) -> str:
         return "openai"
     raise LLMError(
         f"Cannot route model {model!r} to a provider: expected a "
-        "gpt-*/o<digit>*/text-embedding-* prefix (OpenAI) or a "
-        "gemini-*/gemma-* prefix (Google)."
+        "gpt-*/o<digit>*/text-embedding-* prefix (OpenAI), a "
+        f"gemini-*/gemma-* prefix (Google), or a {LOCAL_MODEL_PREFIX!r} prefix "
+        "(local weights, e.g. 'local:Qwen/Qwen2.5-7B-Instruct')."
     )
 
 
@@ -414,6 +446,13 @@ direction (see module docstring)."""
 
 
 def _cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    # Local weights cost nothing per token. Without this they fall through to
+    # `_FALLBACK_PRICE` ($15/$75 per 1M, deliberately punitive for un-priced
+    # models) and the budget cap refuses free inference within a few calls.
+    # Electricity and the GPU are real costs, but they are not per-token and
+    # this ledger measures per-token API spend.
+    if model.startswith(LOCAL_MODEL_PREFIX):
+        return 0.0
     price = PRICING.get(model, _FALLBACK_PRICE)
     return (prompt_tokens / 1_000_000) * price.input + (completion_tokens / 1_000_000) * price.output
 
@@ -422,9 +461,25 @@ DEFAULT_MAX_USD = 5.00
 
 
 def _max_usd() -> float:
-    """Read fresh from the environment every call (not frozen at import) so
-    a test or a caller can `monkeypatch`/`setenv` it per-call."""
+    """Read fresh every call (not frozen at import) so a test or a caller can
+    `monkeypatch`/`setenv` it per-call.
+
+    Checks `os.environ` FIRST, then falls back to `.env` — the same two-source
+    order `resolve_openai_key`/`resolve_google_key` use, and for the same
+    reason. Reading only `os.environ` made the effective cap depend on import
+    ORDER: a value in `.env` took effect only if some other module happened to
+    have called `load_dotenv()` first (`eval/judge.py` and `hydra_client.py`
+    both do, at import). So a process that imported `llm` alone silently fell
+    back to the $5.00 default, while a harness process saw the configured $50 —
+    same repo, same `.env`, different cap, no warning either way. Observed
+    2026-08-18: a bare `llm.complete()` refused a call for exceeding a cap the
+    operator had explicitly raised.
+
+    A spend limit whose value depends on which module imported first is not a
+    spend limit."""
     raw = os.environ.get("MEDMEMGRAPH_MAX_USD")
+    if raw is None or not raw.strip():
+        raw = _parse_dotenv(_DEFAULT_DOTENV_PATH).get("MEDMEMGRAPH_MAX_USD")
     if raw is None or not raw.strip():
         return DEFAULT_MAX_USD
     try:
@@ -1253,6 +1308,406 @@ def _google_complete_once(
     return text, usage
 
 
+
+# ---------------------------------------------------------------------------
+# Local provider — HuggingFace weights on this machine's own GPU/CPU.
+# ---------------------------------------------------------------------------
+
+LOCAL_MODEL_PREFIX = "local:"
+"""Model-id prefix that routes to on-disk weights: `local:Qwen/Qwen2.5-7B-Instruct`.
+
+Everything after the prefix is handed verbatim to `transformers`
+`from_pretrained`, so it accepts a Hub id OR a local directory."""
+
+LOCAL_DEVICE_ENV = "MEDMEMGRAPH_LOCAL_DEVICE"
+LOCAL_DTYPE_ENV = "MEDMEMGRAPH_LOCAL_DTYPE"
+LOCAL_MAX_INPUT_TOKENS_ENV = "MEDMEMGRAPH_LOCAL_MAX_INPUT_TOKENS"
+LOCAL_QUANT_ENV = "MEDMEMGRAPH_LOCAL_QUANT"
+"""`8bit` / `4bit` / unset. Quantized loading needs `bitsandbytes` and trades a
+little quality for a lot of VRAM: Qwen2.5-7B is ~15.2 GB in fp16 (does not fit a
+16 GB card beside an embedder) and ~7.6 GB in 8-bit (fits with room)."""
+
+LOCAL_SKIP_PREFLIGHT_ENV = "MEDMEMGRAPH_LOCAL_SKIP_PREFLIGHT"
+"""Escape hatch for the memory pre-flight below. Set to `1` only if you know the
+estimate is wrong for your setup — the check exists because the failure mode it
+prevents is not an exception."""
+
+_HOST_HEADROOM_GB = 2.0
+"""Spare host RAM to leave unclaimed. `from_pretrained` peaks above the largest
+shard (tokenizer, safetensors mmap, dtype conversion), and a *global* OOM does
+not politely kill just this process."""
+
+_VRAM_HEADROOM_GB = 1.5
+"""Spare VRAM for the embedder (~1.2 GB), any reranker, and the KV cache."""
+
+
+def _dir_size_gb(path: "pathlib.Path") -> float:
+    """On-disk size in GB, counting each physical file ONCE.
+
+    Deduplicated by `(st_dev, st_ino)` because a HuggingFace cache stores each
+    weight once under `blobs/` and symlinks it into `snapshots/`; a naive
+    `rglob` sum counts both and reports exactly double. That bug shipped in this
+    guard's first revision and made it refuse a 7B/8-bit load needing ~7.1 GB by
+    sizing it at 14.2 GB — and it only appeared once the model was cached, so
+    the first (uncached) run passed and the second did not."""
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for f in path.rglob("*"):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        if not f.is_file():
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key in seen:
+            continue
+        seen.add(key)
+        total += st.st_size
+    return total / 1024**3
+
+
+def _preflight_local_load(hf_id: str, device: str, quant: str | None) -> None:
+    """Refuse a local model load that the machine cannot survive.
+
+    **Why this is a hard gate and not a warning.** On 2026-08-18 a
+    `Qwen2.5-3B-Instruct` fp16 load on a 15.9 GB WSL2 box triggered a kernel
+    *global* OOM (`anon-rss 8.3 GB`). The kernel did not kill just the loader —
+    the VM went down, which took the HydraDB container with it, and because that
+    container runs `CLOUD_PROVIDER=memory` the entire ingested graph (13,406
+    facts, 30,086 turns, 4h of work) was gone. VS Code was holding 8 GB at the
+    time, leaving 6.5 GB against a load that peaked at 8.3 GB.
+
+    An exception costs a run. A global OOM costs the machine. Anything that can
+    take down the host has to refuse first and explain, so this raises
+    `LocalModelError` naming the numbers before a single weight is read.
+
+    Estimates come from the real on-disk size of the HF snapshot when it is
+    already cached, so the common path is measured rather than guessed. Set
+    `$MEDMEMGRAPH_LOCAL_SKIP_PREFLIGHT=1` to override.
+    """
+    if os.environ.get(LOCAL_SKIP_PREFLIGHT_ENV) == "1":
+        return
+
+    import pathlib as _pathlib
+
+    import torch
+
+    # Weight size: prefer the cached snapshot on disk; fall back to a
+    # parameter-count guess parsed from the model id ("...-7B-..." -> 7).
+    weights_gb: float | None = None
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_dir = _pathlib.Path(
+            snapshot_download(hf_id, local_files_only=True, allow_patterns=["*.json"])
+        )
+        # Size the SNAPSHOT dir, not its grandparent. The grandparent is the
+        # model repo root holding both `blobs/` and `snapshots/`, and the latter
+        # symlinks into the former — sizing it reports double.
+        weights_gb = _dir_size_gb(snapshot_dir)
+    except Exception:  # noqa: BLE001 — not cached yet, or a local path
+        candidate = _pathlib.Path(hf_id)
+        if candidate.is_dir():
+            weights_gb = _dir_size_gb(candidate)
+    if weights_gb is None or weights_gb <= 0:
+        match = re.search(r"(\d+(?:\.\d+)?)\s*[bB]\b", hf_id)
+        params_b = float(match.group(1)) if match else 7.0
+        weights_gb = params_b * 2.0  # fp16: 2 bytes/param
+
+    if quant == "8bit":
+        weights_gb *= 0.5
+    elif quant == "4bit":
+        weights_gb *= 0.28
+
+    # Host RAM: with device_map streaming, peak is roughly the largest shard.
+    # Shards are conventionally <=5 GB, so bound by min(weights, 5) + headroom.
+    peak_host_gb = min(weights_gb, 5.0) + _HOST_HEADROOM_GB
+    available_gb = _available_ram_gb()
+    if available_gb is not None and peak_host_gb > available_gb:
+        raise LocalModelError(
+            f"Refusing to load {hf_id!r}: needs ~{peak_host_gb:.1f} GB host RAM "
+            f"(largest shard + {_HOST_HEADROOM_GB:.1f} GB headroom) but only "
+            f"{available_gb:.1f} GB is available. A load this size triggered a "
+            f"kernel global OOM on this machine before, which rebooted the VM and "
+            f"destroyed the in-memory graph. Free host RAM (closing extra VS Code "
+            f"windows recovered ~5 GB), pick a smaller model, set "
+            f"${LOCAL_QUANT_ENV}=8bit, or override with "
+            f"${LOCAL_SKIP_PREFLIGHT_ENV}=1."
+        )
+
+    if device.startswith("cuda") and torch.cuda.is_available():
+        free_bytes, _total = torch.cuda.mem_get_info(0)
+        free_vram_gb = free_bytes / 1024**3
+        needed_vram_gb = weights_gb + _VRAM_HEADROOM_GB
+        if needed_vram_gb > free_vram_gb:
+            hint = (
+                f" Try ${LOCAL_QUANT_ENV}=8bit (roughly halves it)."
+                if quant is None
+                else f" Try ${LOCAL_QUANT_ENV}=4bit."
+            )
+            raise LocalModelError(
+                f"Refusing to load {hf_id!r} on {device}: needs ~{needed_vram_gb:.1f} GB "
+                f"VRAM (weights ~{weights_gb:.1f} GB + {_VRAM_HEADROOM_GB:.1f} GB for the "
+                f"embedder/reranker/KV cache) but only {free_vram_gb:.1f} GB is free.{hint}"
+            )
+
+
+def _available_ram_gb() -> float | None:
+    """Host RAM currently available, from `/proc/meminfo`. `MemAvailable` (not
+    `MemFree`) is the kernel's own estimate of what a new allocation can claim
+    without swapping. Returns None off Linux."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024**2
+    except OSError:
+        return None
+    return None
+
+
+_DEFAULT_LOCAL_MAX_INPUT_TOKENS = 8192
+"""Prompt-side truncation guard. A local model has a hard context window and,
+unlike an API, no server-side error telling you that you exceeded it — it will
+happily produce garbage instead. Truncation here is reported on the response
+(`truncated=True`) rather than applied silently."""
+
+_local_models: dict[str, Any] = {}
+
+
+def _get_local_model(hf_id: str):
+    """Load (once per process) and cache a local causal LM + tokenizer.
+
+    Kept in a module-level dict rather than an lru_cache so a caller can drop a
+    model to reclaim VRAM: `llm._local_models.clear()`."""
+    cached = _local_models.get(hf_id)
+    if cached is not None:
+        return cached
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    device = os.environ.get(LOCAL_DEVICE_ENV) or ("cuda" if torch.cuda.is_available() else "cpu")
+    dtype_name = os.environ.get(LOCAL_DTYPE_ENV) or ("float16" if device == "cuda" else "float32")
+    quant = (os.environ.get(LOCAL_QUANT_ENV) or "").strip().lower() or None
+    if quant not in (None, "8bit", "4bit"):
+        raise LocalModelError(
+            f"${LOCAL_QUANT_ENV}={quant!r} is not recognized; use '8bit', '4bit', or leave it unset."
+        )
+
+    # Refuse before reading a single weight — see _preflight_local_load for why
+    # this is a hard gate rather than a warning.
+    _preflight_local_load(hf_id, device, quant)
+
+    tokenizer = AutoTokenizer.from_pretrained(hf_id)
+    quant_config = None
+    if quant is not None:
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:  # pragma: no cover - transformers is a hard dep
+            raise LocalModelError(f"quantization requested but unavailable: {exc}") from exc
+        if quant == "8bit":
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+        else:
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=getattr(torch, dtype_name),
+                bnb_4bit_quant_type="nf4",
+            )
+    # `device_map=` (accelerate), NOT `.from_pretrained(...).to(device)`.
+    #
+    # The `.to(device)` form materializes the ENTIRE model in system RAM first
+    # and only then copies it to the GPU, so peak host memory is the full model
+    # size no matter how much VRAM is free. That killed a 3B fp16 load on this
+    # 15 GB WSL2 box (kernel OOM at 8.3 GB RSS) while the GPU sat with 15.8 GB
+    # free — the load never got far enough to use it. `device_map` streams the
+    # checkpoint shard by shard straight onto the target device, so peak host
+    # memory is one shard, not one model.
+    #
+    # An earlier revision of this function avoided `accelerate` deliberately, to
+    # keep the dependency list unchanged. That was the wrong trade: it bought a
+    # shorter dependency list and paid with a loader that cannot load anything
+    # bigger than free system RAM, which on this machine is smaller than the GPU.
+    load_kwargs: dict[str, Any] = {
+        "device_map": device,
+        "low_cpu_mem_usage": True,
+    }
+    if quant_config is not None:
+        # bitsandbytes owns the on-device dtype; passing `dtype=` alongside it
+        # is ignored at best and conflicting at worst.
+        load_kwargs["quantization_config"] = quant_config
+    else:
+        load_kwargs["dtype"] = getattr(torch, dtype_name)
+    model = AutoModelForCausalLM.from_pretrained(hf_id, **load_kwargs)
+    model.eval()
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    _local_models[hf_id] = (tokenizer, model, device)
+    return _local_models[hf_id]
+
+
+def _local_complete_once(
+    *,
+    model: str,
+    system: str | None,
+    prompt: str,
+    schema: dict | None,
+    max_tokens: int,
+    temperature: float,
+) -> tuple[str, "_Usage"]:
+    """One generation against local weights. Same contract as the OpenAI and
+    Google `_*_complete_once` functions, so the retry/schema/cache/ledger
+    machinery above is untouched.
+
+    **Structured output is prompted, not constrained.** OpenAI and Google both
+    offer native schema-constrained decoding; `transformers` alone does not, and
+    adding a constrained-decoding dependency (outlines/guidance) is a bigger
+    change than this seam. So when `schema` is given, the schema is appended to
+    the system prompt as an instruction and the model's JSON is parsed by the
+    SAME `_complete_with_schema_retry` loop that already handles a provider
+    returning malformed JSON.
+
+    That is a real quality difference, stated rather than hidden: this project's
+    own `literature/17` notes that prompted JSON mode can cost significant
+    accuracy versus constrained decoding. A local model is therefore the right
+    choice for cost-free bulk generation and the wrong choice for the
+    schema-heavy extraction path unless you have measured it on your own data.
+    """
+    import torch
+
+    hf_id = model[len(LOCAL_MODEL_PREFIX):]
+    tokenizer, lm, device = _get_local_model(hf_id)
+
+    sys_text = system or ""
+    if schema is not None:
+        sys_text = (
+            f"{sys_text}\n\nRespond with ONLY a single valid JSON object matching "
+            f"this schema. No prose, no markdown fence, no trailing commentary. "
+            f"Start your reply with '{{' and end it with '}}'.\n"
+            f"Schema: {json.dumps(schema)}\n"
+            f"Skeleton to fill in (same keys, same nesting):\n{_schema_skeleton(schema)}"
+        ).strip()
+
+    messages = ([{"role": "system", "content": sys_text}] if sys_text else []) + [
+        {"role": "user", "content": prompt}
+    ]
+    try:
+        text_in = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:  # noqa: BLE001 — model without a chat template
+        text_in = (f"{sys_text}\n\n" if sys_text else "") + prompt
+
+    max_input = int(os.environ.get(LOCAL_MAX_INPUT_TOKENS_ENV) or _DEFAULT_LOCAL_MAX_INPUT_TOKENS)
+    enc = tokenizer(text_in, return_tensors="pt", truncation=True, max_length=max_input)
+    prompt_tokens = int(enc["input_ids"].shape[-1])
+    input_truncated = prompt_tokens >= max_input
+    enc = {k: v.to(lm.device) for k, v in enc.items()}
+
+    with torch.no_grad():
+        out = lm.generate(
+            **enc,
+            max_new_tokens=max_tokens,
+            do_sample=temperature > 0,
+            temperature=temperature if temperature > 0 else None,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+    generated = out[0][prompt_tokens:]
+    completion_tokens = int(generated.shape[-1])
+    text = tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+    if schema is not None:
+        text = _extract_json_object(text)
+
+    return text, _Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        # Either side hitting its ceiling is a real truncation the caller must
+        # be able to see; the schema-retry loop uses this to widen max_tokens.
+        truncated=input_truncated or completion_tokens >= max_tokens,
+    )
+
+
+
+def _schema_skeleton(schema: dict) -> str:
+    """A minimal filled-in example of `schema`, for the prompted-structured-output
+    path.
+
+    A schema alone underspecifies the target for a small local model: given only
+    the JSON Schema, a 7B emits valid JSON most of the time but not every time,
+    and an intermittent failure is worse than a consistent one because it shows
+    up as a scattering of wrong answers rather than an obvious bug. Showing the
+    literal shape to fill in is the cheapest reliability win available without
+    adding a constrained-decoding dependency."""
+
+    def _example(node: dict):
+        t = node.get("type")
+        if t == "object":
+            return {k: _example(v) for k, v in (node.get("properties") or {}).items()}
+        if t == "array":
+            return [_example(node.get("items") or {"type": "string"})]
+        if t == "boolean":
+            return True
+        if t == "integer":
+            return 0
+        if t == "number":
+            return 0.0
+        return "..."
+
+    return json.dumps(_example(schema), indent=None)
+
+
+def _extract_json_object(text: str) -> str:
+    """Pull the outermost balanced JSON object out of a model completion.
+
+    Prompted structured output is best-effort: a local model that is told "reply
+    with only JSON" mostly complies, but sometimes wraps the object in a
+    markdown fence, prefixes it with "Here is the JSON:", or appends a sentence
+    of commentary. Each of those makes `json.loads` fail on output that is
+    otherwise perfectly good, and the caller then burns its retry budget and
+    finally reports the item as a wrong answer — a measurement error dressed up
+    as a model error.
+
+    Brace-counting rather than a regex, and string-aware so a `{` or `}` inside a
+    quoted note (clinical text contains both) does not throw off the depth
+    count."""
+    if not text:
+        return text
+    fenced = text.strip()
+    if fenced.startswith("```"):
+        fenced = fenced.split("\n", 1)[-1] if "\n" in fenced else fenced
+        fenced = fenced.rsplit("```", 1)[0]
+    start = fenced.find("{")
+    if start == -1:
+        return fenced.strip()
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(fenced)):
+        ch = fenced[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return fenced[start : i + 1]
+    # Unbalanced (usually a genuine truncation) — hand back what we have so the
+    # retry loop sees a real JSONDecodeError and can widen max_tokens.
+    return fenced[start:].strip()
+
+
 def _record_failed_schema_attempt(ledger: Ledger, model: str, usage: _Usage) -> None:
     """Every schema-retry attempt that reaches this point produced a REAL
     completion — real tokens the provider already billed — that is being
@@ -1297,6 +1752,11 @@ def _complete_with_schema_retry(
         def _once() -> tuple[str, _Usage]:
             if provider == "openai":
                 return _openai_complete_once(
+                    model=model, system=system, prompt=prompt, schema=schema,
+                    max_tokens=current_max_tokens, temperature=temperature,
+                )
+            if provider == "local":
+                return _local_complete_once(
                     model=model, system=system, prompt=prompt, schema=schema,
                     max_tokens=current_max_tokens, temperature=temperature,
                 )
@@ -1636,8 +2096,10 @@ def embed(
 
 
 __all__ = [
+    "resolve_key_for_model",
     "LLMError",
     "MissingAPIKeyError",
+    "LocalModelError",
     "BudgetExceeded",
     "SchemaValidationError",
     "TruncationError",

@@ -6,9 +6,10 @@ content: see [What this video does not
 do](#what-this-video-does-not-do)). Content past 3:00 may not be reviewed,
 per the hackathon's own rule.
 
-Record after the feature freeze (2026-08-18) with a real `ANTHROPIC_API_KEY`
-configured and at least one patient ingested and hand-checked
-(`fixtures/handcheck/PASSED`, E2-S3). Every command below assumes HydraDB
+Record after the feature freeze (2026-08-18) with real `OPENAI_API_KEY` and
+`GOOGLE_API_KEY` values configured (this project does not use Anthropic) and
+at least one patient ingested (`scripts/ingest_corpus.py`) behind a passed
+hand-check (`fixtures/handcheck/PASSED`, E2-S3). Every command below assumes HydraDB
 OSS is already booted (`bash scripts/run_hydradb.sh`) and the demo patient
 exists in the graph.
 

@@ -183,9 +183,10 @@ almost certainly fail to fit the story's actual 4 GB target). See
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, replace
-from typing import Callable, Protocol, runtime_checkable
+from typing import Callable, Mapping, Protocol, runtime_checkable
 
 from medmemgraph.contracts import RetrieveItem
 
@@ -198,6 +199,9 @@ __all__ = [
     "CrossEncoderReranker",
     "TwoStageResult",
     "two_stage_retrieve",
+    "RERANKER_ENV_VAR",
+    "spec_from_env",
+    "reranker_from_env",
 ]
 
 
@@ -460,16 +464,33 @@ class CrossEncoderReranker:
         self,
         model_key: str = DEFAULT_MODEL_KEY,
         *,
+        spec: RerankerModelSpec | None = None,
         device: str | None = None,
         batch_size: int = 32,
         fp16: bool | None = None,
         max_length: int = 4096,
     ) -> None:
-        if model_key not in REGISTERED_MODELS:
+        # `spec=` is the escape hatch for a checkpoint that is not (and should
+        # not be) in `REGISTERED_MODELS` — in particular a locally fine-tuned
+        # one, which has no business being baked into a registry that
+        # `tests/test_reranker.py` asserts the exact contents of. `spec.hf_id`
+        # flows straight into `from_pretrained`/`CrossEncoder`, both of which
+        # accept a local directory path, so nothing else in this class needs to
+        # know the difference. `spec_from_env()` builds one of these from
+        # `$MEDMEMGRAPH_RERANKER*` so the handoff is "hand me a directory".
+        #
+        # Registry behaviour is unchanged when `spec` is omitted: an unknown
+        # `model_key` still raises.
+        if spec is not None:
+            self.spec = spec
+        elif model_key not in REGISTERED_MODELS:
             raise ValueError(
-                f"unregistered reranker model_key={model_key!r}; choose one of {sorted(REGISTERED_MODELS)}"
+                f"unregistered reranker model_key={model_key!r}; choose one of "
+                f"{sorted(REGISTERED_MODELS)}, or pass spec=RerankerModelSpec(...) "
+                "for a local checkpoint"
             )
-        self.spec = REGISTERED_MODELS[model_key]
+        else:
+            self.spec = REGISTERED_MODELS[model_key]
         self.batch_size = batch_size
         self.max_length = max_length
         self._device = device
@@ -765,4 +786,142 @@ def two_stage_retrieve(
         retrieve_latency_ms=retrieve_latency_ms,
         rerank_latency_ms=rerank_latency_ms,
         n_candidates=len(candidates),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Environment-driven selection — the fine-tuned-checkpoint handoff surface.
+# ---------------------------------------------------------------------------
+
+RERANKER_ENV_VAR = "MEDMEMGRAPH_RERANKER"
+
+_ENV_KIND = "MEDMEMGRAPH_RERANKER_KIND"
+_ENV_BACKEND = "MEDMEMGRAPH_RERANKER_BACKEND"
+_ENV_ONNX_FILE = "MEDMEMGRAPH_RERANKER_ONNX_FILE"
+_ENV_INSTRUCTION = "MEDMEMGRAPH_RERANKER_INSTRUCTION"
+_ENV_TRUST_REMOTE_CODE = "MEDMEMGRAPH_RERANKER_TRUST_REMOTE_CODE"
+_ENV_DEVICE = "MEDMEMGRAPH_RERANKER_DEVICE"
+_ENV_BATCH_SIZE = "MEDMEMGRAPH_RERANKER_BATCH_SIZE"
+_ENV_MAX_LENGTH = "MEDMEMGRAPH_RERANKER_MAX_LENGTH"
+
+ENV_DEFAULT_MAX_LENGTH = 512
+"""Not the class default of 4096. That number is sized for GPU-era long-document
+reranking; the docs this project reranks are single turns and +/-2-turn windows,
+and on a CPU target the quadratic attention cost of an 8x longer window is the
+difference between a usable demo and an unusable one. Override per deployment."""
+
+ENV_DEFAULT_BATCH_SIZE = 4
+"""Small on purpose, sized by the worst case rather than the typical one.
+
+A `causal_yesno` reranker (Qwen3-Reranker) runs a full causal-LM forward pass,
+which materializes logits for EVERY position: `batch x seq_len x vocab`. At
+batch 16, seq 512, Qwen3's 151,936-token vocab, fp32, that is
+
+    16 x 512 x 151936 x 4 bytes = 4.97 GB
+
+for the logits alone — measured, not estimated: a 16 GB RTX 4080 SUPER OOMed on
+an allocation of exactly 4,970,250,240 bytes during the first reranked eval run
+(2026-08-18). Batch 4 brings that term to ~1.24 GB.
+
+A `seq_classification` reranker produces one scalar per pair and has no such
+term, so it tolerates a far larger batch. The default is set for the model class
+that can actually fail; raise it via `MEDMEMGRAPH_RERANKER_BATCH_SIZE` where the
+head shape allows."""
+ENV_DEFAULT_DEVICE = "cpu"
+"""CPU by default rather than `None` (which auto-picks CUDA when present),
+because the stated deployment target for the fine-tuned reranker is a
+CPU-only box — a config that silently only performs on the dev machine's GPU
+would hide exactly the latency this arm exists to measure."""
+
+_OFF_VALUES = frozenset({"", "0", "off", "false", "none", "noop"})
+
+
+def spec_from_env(env: Mapping[str, str] | None = None) -> RerankerModelSpec | None:
+    """Build a `RerankerModelSpec` from `$MEDMEMGRAPH_RERANKER`, or `None` if
+    reranking is off.
+
+    `$MEDMEMGRAPH_RERANKER` accepts three things:
+      * unset / empty / `0` / `off` / `false` / `none` / `noop` -> `None`
+        (reranking disabled — the default, and byte-identical behaviour to
+        before this seam existed)
+      * a `REGISTERED_MODELS` key -> that registered spec, verbatim
+      * anything else -> treated as an `hf_id`: a Hugging Face id OR a local
+        checkpoint directory, described by the companion `_KIND`/`_BACKEND`/
+        `_ONNX_FILE`/`_INSTRUCTION` variables.
+
+    The third form is the point: a teammate fine-tuning a reranker hands over a
+    directory and sets one environment variable. No registry edit, no code
+    change, no PR. `REGISTERED_MODELS` stays exactly as
+    `tests/test_reranker.py` asserts it.
+
+    Note `kind` defaults to `seq_classification` (a regression head). A
+    `causal_yesno` model runs a full causal-LM forward pass per candidate, which
+    at 50 candidates on a small CPU is seconds per query — fine for an offline
+    ablation, not for the live read path.
+    """
+    env = os.environ if env is None else env
+    raw = (env.get(RERANKER_ENV_VAR) or "").strip()
+    if raw.lower() in _OFF_VALUES:
+        return None
+    if raw in REGISTERED_MODELS:
+        return REGISTERED_MODELS[raw]
+
+    kind = (env.get(_ENV_KIND) or "seq_classification").strip()
+    if kind not in ("seq_classification", "causal_yesno"):
+        raise ValueError(
+            f"{_ENV_KIND}={kind!r} is not a recognized reranker kind; "
+            "expected 'seq_classification' or 'causal_yesno'"
+        )
+    backend = (env.get(_ENV_BACKEND) or "torch").strip()
+    if backend not in ("torch", "onnx"):
+        raise ValueError(f"{_ENV_BACKEND}={backend!r} must be 'torch' or 'onnx'")
+    if backend == "onnx" and kind == "causal_yesno":
+        # Stated rather than silently mis-dispatched: `_ensure_loaded` routes
+        # `backend == "onnx"` through the sentence-transformers CrossEncoder
+        # path only, so an ONNX causal model would load down the wrong branch.
+        raise ValueError(
+            "backend='onnx' with kind='causal_yesno' is not supported yet — the ONNX "
+            "path currently loads only sequence-classification cross-encoders. Export "
+            "the fine-tune with a classification head, or keep backend='torch'."
+        )
+
+    return RerankerModelSpec(
+        key="env",
+        hf_id=raw,
+        kind=kind,
+        instruction=env.get(_ENV_INSTRUCTION) or None,
+        trust_remote_code=(env.get(_ENV_TRUST_REMOTE_CODE) or "0").strip().lower()
+        in ("1", "true", "yes", "on"),
+        backend=backend,
+        onnx_file=env.get(_ENV_ONNX_FILE) or None,
+    )
+
+
+def reranker_from_env(env: Mapping[str, str] | None = None) -> RerankerBackend | None:
+    """`spec_from_env()` plus construction, or `None` when reranking is off.
+
+    Returns `None` rather than a `NoopReranker` on purpose. `NoopReranker.rerank`
+    emits synthetic descending scores, so running it would overwrite every
+    `RetrieveItem.score` in the default read path — the "no special case" version
+    of this would silently change the disabled-by-default behaviour it is
+    supposed to preserve. `NoopReranker` remains the control arm in
+    `eval/retrieval_eval.py`, which is where an explicit no-op belongs.
+    """
+    env = os.environ if env is None else env
+    spec = spec_from_env(env)
+    if spec is None:
+        return None
+
+    def _int(name: str, default: int) -> int:
+        try:
+            return int(env.get(name) or default)
+        except ValueError:
+            return default
+
+    return CrossEncoderReranker(
+        spec=spec,
+        device=(env.get(_ENV_DEVICE) or ENV_DEFAULT_DEVICE).strip() or None,
+        batch_size=_int(_ENV_BATCH_SIZE, ENV_DEFAULT_BATCH_SIZE),
+        fp16=False,
+        max_length=_int(_ENV_MAX_LENGTH, ENV_DEFAULT_MAX_LENGTH),
     )

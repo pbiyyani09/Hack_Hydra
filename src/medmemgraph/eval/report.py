@@ -689,6 +689,85 @@ def build_report(
     )
 
 
+
+def load_results_pooled(
+    results_dir: str | os.PathLike[str],
+    patient_ids: Sequence[str] | None = None,
+    *,
+    system_names: Sequence[str] | None = None,
+    target_mde: float = DEFAULT_TARGET_MDE,
+) -> list[SystemResult]:
+    """One `SystemResult` per system, pooling every patient's items together.
+
+    `load_results_dir` is per-patient, which is the wrong grain for the headline
+    table: a single patient contributes on the order of a dozen items per
+    `question_type`, so every per-category cell comes back flagged
+    `underpowered` and the table says nothing. Statistical power here comes from
+    pooling across patients, not from more items per patient.
+
+    Safe to pool because MedLoCoMo `qa_id`s are patient-prefixed
+    (`10056223_cross_q63`) and verified collision-free across patients — checked
+    against the real corpus, not assumed. That matters: `_align_by_qa_id` pairs
+    systems on `qa_id`, so a collision would silently align two DIFFERENT
+    patients' items and quietly corrupt every McNemar test.
+
+    Systems are pooled over whatever patients are present. A system missing a
+    patient another system has is not silently tolerated — the paired tests
+    intersect on `qa_id`, so it simply contributes fewer pairs, and
+    `Report.n_items` per system makes the imbalance visible.
+    """
+    by_system: dict[str, list[dict]] = {}
+    for path in sorted(Path(results_dir).glob("*__*.json")):
+        d = json.loads(path.read_text())
+        if system_names is not None and d.get("system_name") not in system_names:
+            continue
+        if patient_ids is not None and d.get("patient_id") not in patient_ids:
+            continue
+        by_system.setdefault(d["system_name"], []).append(d)
+
+    pooled: list[SystemResult] = []
+    for system_name, runs in sorted(by_system.items()):
+        merged = dict(runs[0])
+        merged["records"] = [rec for run in runs for rec in run.get("records", [])]
+        merged["n_items"] = len(merged["records"])
+        merged["n_truncated"] = sum(run.get("n_truncated", 0) for run in runs)
+        merged["patient_id"] = f"pooled({len(runs)} patients)"
+        # A pooled row is only interpretable if every run used the same judge;
+        # mixing an LLM judge with the token-overlap fallback would silently
+        # blend two different measurement instruments into one accuracy number.
+        judge_kinds = {run.get("judge_kind") for run in runs}
+        merged["judge_kind"] = judge_kinds.pop() if len(judge_kinds) == 1 else "MIXED"
+        dry = {bool(run.get("dry_run")) for run in runs}
+        merged["dry_run"] = any(dry)
+        pooled.append(load_system_result_from_run_dict(merged, target_mde=target_mde))
+    return pooled
+
+
+def build_pooled_report(
+    *,
+    results_dir: str | os.PathLike[str] = "results",
+    patient_ids: Sequence[str] | None = None,
+    system_names: Sequence[str] | None = None,
+    baseline_name: str = FULLCTX_SYSTEM,
+    target_mde: float = DEFAULT_TARGET_MDE,
+) -> Report:
+    """The headline report: every system, every patient, one table."""
+    systems = load_results_pooled(
+        results_dir, patient_ids, system_names=system_names, target_mde=target_mde
+    )
+    return build_report(
+        systems,
+        baseline_name=baseline_name,
+        run_config={
+            "grain": "pooled across patients",
+            "results_dir": str(results_dir),
+            "patients": "all found" if patient_ids is None else ",".join(patient_ids),
+            "target_mde": target_mde,
+        },
+        target_mde=target_mde,
+    )
+
+
 def build_report_for_patient(
     patient_id: str,
     *,
@@ -1017,3 +1096,92 @@ __all__ = [
     "render_markdown",
     "write_markdown",
 ]
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_arg_parser() -> "argparse.ArgumentParser":
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="python -m medmemgraph.eval.report",
+        description="Render the results table from the harness's per-patient JSON files.",
+    )
+    p.add_argument(
+        "--patients",
+        nargs="+",
+        default=None,
+        help="restrict to these patient ids (default: every results file found)",
+    )
+    p.add_argument(
+        "--per-patient",
+        action="store_true",
+        help="one report per patient instead of the pooled table. Per-patient "
+        "category cells are almost always underpowered — pooled is the headline.",
+    )
+    p.add_argument("--system", action="extend", nargs="+", default=None, help="restrict to these systems")
+    p.add_argument("--results-dir", default="results")
+    p.add_argument("--baseline", default=FULLCTX_SYSTEM, help="system the paired tests compare against")
+    p.add_argument(
+        "--target-mde",
+        type=float,
+        default=DEFAULT_TARGET_MDE,
+        help="effect size the run is powered to detect; categories below it are "
+        "marked underpowered rather than reported as clean comparisons",
+    )
+    p.add_argument("--markdown", action="store_true", help="also write a markdown report under --results-dir")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    import sys
+
+    args = build_arg_parser().parse_args(argv)
+
+    reports: list[Report] = []
+    if args.per_patient:
+        patients = args.patients or sorted(
+            {p.name.split("__", 1)[0] for p in Path(args.results_dir).glob("*__*.json")}
+        )
+        for patient_id in patients:
+            reports.append(
+                build_report_for_patient(
+                    patient_id,
+                    results_dir=args.results_dir,
+                    system_names=args.system,
+                    baseline_name=args.baseline,
+                    target_mde=args.target_mde,
+                )
+            )
+    else:
+        reports.append(
+            build_pooled_report(
+                results_dir=args.results_dir,
+                patient_ids=args.patients,
+                system_names=args.system,
+                baseline_name=args.baseline,
+                target_mde=args.target_mde,
+            )
+        )
+
+    if not any(r.systems for r in reports):
+        print(
+            f"no results found under {args.results_dir!r} — run "
+            "`python -m medmemgraph.eval.harness --patient <id>` first",
+            file=sys.stderr,
+        )
+        return 1
+
+    for report in reports:
+        print(render_terminal(report))
+        print()
+        if args.markdown:
+            print(f"wrote {write_markdown(report, results_dir=args.results_dir)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

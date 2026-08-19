@@ -214,6 +214,14 @@ def isolate_llm_module(tmp_path, monkeypatch):
     monkeypatch.setattr(llm, "_openai_client", None)
     monkeypatch.setattr(llm, "_google_client", None)
     monkeypatch.delenv("MEDMEMGRAPH_MAX_USD", raising=False)
+    # Point `.env` resolution at a path that does not exist. This module's own
+    # docstring already promised tests "never ... read the real `.env`", but
+    # nothing enforced it: key resolution and (since 2026-08-18) the spend cap
+    # both fall back to `_DEFAULT_DOTENV_PATH`, so the repo's real `.env` was
+    # one `delenv` away from leaking into a test. It did, the moment
+    # `_max_usd()` learned to read `.env`: the cap-default test started seeing
+    # the operator's real $50 instead of the $5 default.
+    monkeypatch.setattr(llm, "_DEFAULT_DOTENV_PATH", tmp_path / "nonexistent.env")
     monkeypatch.setattr(llm, "_sleep", lambda seconds: None)
     yield
 
@@ -759,8 +767,35 @@ class TestRetryBackoff:
 
 class TestCompleteMany:
     def test_returns_results_in_input_order(self, monkeypatch):
-        fake = FakeOpenAIClient(responses=["r0", "r1", "r2"])
+        """`complete_many` must place prompt i's response at index i regardless
+        of which thread finishes first.
+
+        The fake here maps PROMPT -> response, rather than handing out responses
+        in arrival order like `FakeOpenAIChat` does. That matters: with
+        `max_concurrency=2` an arrival-ordered fake races, so `p0` could be
+        served `r1` and the test failed intermittently while `complete_many`
+        (which assigns `results[i]` by index) was perfectly correct. An
+        arrival-ordered fake cannot distinguish "results came back shuffled"
+        from "the fake shuffled them", so it could never have tested this
+        invariant. Also adds a barrier so the completion order is *guaranteed*
+        reversed, making the assertion deterministic instead of merely usually
+        true."""
+        started = threading.Barrier(2, timeout=5)
+
+        class PromptKeyedChat:
+            def create(self, **kwargs):
+                prompt = kwargs["messages"][-1]["content"]
+                if prompt in ("p0", "p1"):
+                    # Force both to be in flight, then let p1 answer first.
+                    started.wait()
+                    if prompt == "p0":
+                        time.sleep(0.05)
+                return _FakeChatCompletion(prompt.replace("p", "r"))
+
+        fake = FakeOpenAIClient()
+        fake.chat.completions = PromptKeyedChat()
         monkeypatch.setattr(llm, "_get_openai_client", lambda: fake)
+
         results = llm.complete_many(
             ["p0", "p1", "p2"], model="gpt-4.1-mini", max_concurrency=2, use_cache=False
         )
@@ -1125,3 +1160,373 @@ class TestCacheKeySemanticsUnchanged:
             prompt_or_text="hi", schema=None, temperature=0.0,
         )
         assert key_a == key_b
+
+
+class TestBudgetCapResolvesFromDotenvToo:
+    """`MEDMEMGRAPH_MAX_USD` must resolve the same two ways the API keys do:
+    `os.environ` first, then `.env`.
+
+    Before 2026-08-18 it read only `os.environ`, so a value in `.env` took
+    effect only if some other module had already called `load_dotenv()` —
+    `eval/judge.py` and `hydra_client.py` both do at import, `llm` alone does
+    not. The effective spend cap therefore depended on IMPORT ORDER: the same
+    repo with the same `.env` enforced $50 in a harness process and $5 in a
+    bare one, silently, in both directions."""
+
+    def test_env_var_wins(self, monkeypatch, tmp_path):
+        dotenv = tmp_path / ".env"
+        dotenv.write_text("MEDMEMGRAPH_MAX_USD=99\n")
+        monkeypatch.setattr(llm, "_DEFAULT_DOTENV_PATH", dotenv)
+        monkeypatch.setenv("MEDMEMGRAPH_MAX_USD", "12.5")
+        assert llm._max_usd() == 12.5
+
+    def test_falls_back_to_dotenv_when_env_var_absent(self, monkeypatch, tmp_path):
+        dotenv = tmp_path / ".env"
+        dotenv.write_text("MEDMEMGRAPH_MAX_USD=42\n")
+        monkeypatch.setattr(llm, "_DEFAULT_DOTENV_PATH", dotenv)
+        monkeypatch.delenv("MEDMEMGRAPH_MAX_USD", raising=False)
+        assert llm._max_usd() == 42.0
+
+    def test_default_when_neither_source_has_it(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(llm, "_DEFAULT_DOTENV_PATH", tmp_path / "nonexistent.env")
+        monkeypatch.delenv("MEDMEMGRAPH_MAX_USD", raising=False)
+        assert llm._max_usd() == llm.DEFAULT_MAX_USD
+
+    def test_garbage_value_falls_back_to_default_rather_than_crashing(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(llm, "_DEFAULT_DOTENV_PATH", tmp_path / "nonexistent.env")
+        monkeypatch.setenv("MEDMEMGRAPH_MAX_USD", "not-a-number")
+        assert llm._max_usd() == llm.DEFAULT_MAX_USD
+
+
+class TestLocalProvider:
+    """`local:<hf_id>` — on-disk weights, no API, no key, no per-token cost.
+
+    Added 2026-08-18 so the eval can run when an API account is exhausted. The
+    tests below never load real weights: `_get_local_model` is monkeypatched, so
+    this class stays offline like every other test in this file."""
+
+    MODEL = "local:some-org/some-model"
+
+    def test_routes_to_the_local_provider(self):
+        assert llm._provider_for_model(self.MODEL) == "local"
+        assert llm._provider_for_model("gpt-4.1-mini") == "openai"
+        assert llm._provider_for_model("gemini-3.5-flash-lite") == "google"
+
+    def test_needs_no_api_key(self, monkeypatch):
+        """Weights are on disk. Key resolution must not raise, and must not
+        fall through to a provider resolver that would."""
+        def _explode():  # pragma: no cover - asserts it is never called
+            raise AssertionError("local model tried to resolve a provider key")
+
+        monkeypatch.setattr(llm, "resolve_openai_key", _explode)
+        monkeypatch.setattr(llm, "resolve_google_key", _explode)
+        assert llm.resolve_key_for_model(self.MODEL) == ""
+
+    def test_costs_nothing_rather_than_the_unpriced_fallback(self):
+        """Without an explicit zero, a local model hits `_FALLBACK_PRICE`
+        ($15/$75 per 1M, deliberately punitive) and the budget cap refuses free
+        inference within a handful of calls."""
+        assert llm._cost_usd(self.MODEL, 1_000_000, 1_000_000) == 0.0
+        assert llm._cost_usd("gpt-4.1-mini", 1_000_000, 0) > 0.0
+
+    def test_unroutable_model_names_still_raise(self):
+        with pytest.raises(llm.LLMError, match="Cannot route model"):
+            llm._provider_for_model("mistral-7b")
+
+    def test_schema_is_appended_to_the_system_prompt(self, monkeypatch):
+        """`transformers` has no constrained decoding, so a schema becomes an
+        instruction and the existing schema-retry loop parses the result. The
+        test asserts the schema actually reaches the model."""
+        seen = {}
+
+        class _Tok:
+            pad_token_id = 0
+            pad_token = None
+            eos_token = "</s>"
+
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                seen["messages"] = messages
+                return "PROMPT"
+
+            def __call__(self, text, return_tensors=None, truncation=None, max_length=None):
+                import torch
+                return {"input_ids": torch.zeros((1, 5), dtype=torch.long)}
+
+            def decode(self, ids, skip_special_tokens=True):
+                return '{"ok": true}'
+
+        class _LM:
+            device = "cpu"
+
+            def generate(self, **kwargs):
+                import torch
+                return torch.zeros((1, 8), dtype=torch.long)
+
+        monkeypatch.setattr(llm, "_get_local_model", lambda hf_id: (_Tok(), _LM(), "cpu"))
+        schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+        text, usage = llm._local_complete_once(
+            model=self.MODEL, system="You are a judge.", prompt="q",
+            schema=schema, max_tokens=32, temperature=0.0,
+        )
+        assert text == '{"ok": true}'
+        system_msg = seen["messages"][0]["content"]
+        assert "You are a judge." in system_msg
+        assert '"ok"' in system_msg, "schema must reach the model as an instruction"
+        assert usage.prompt_tokens == 5
+
+    def test_markdown_fence_is_stripped(self, monkeypatch):
+        """Small local models wrap JSON in ```json fences despite instructions;
+        an unstripped fence fails json.loads and burns a schema retry."""
+        class _Tok:
+            pad_token_id = 0
+            pad_token = None
+            eos_token = "</s>"
+            def apply_chat_template(self, m, tokenize=False, add_generation_prompt=True): return "P"
+            def __call__(self, text, return_tensors=None, truncation=None, max_length=None):
+                import torch
+                return {"input_ids": torch.zeros((1, 3), dtype=torch.long)}
+            def decode(self, ids, skip_special_tokens=True):
+                return '```json\n{"ok": true}\n```'
+
+        class _LM:
+            device = "cpu"
+            def generate(self, **kwargs):
+                import torch
+                return torch.zeros((1, 6), dtype=torch.long)
+
+        monkeypatch.setattr(llm, "_get_local_model", lambda hf_id: (_Tok(), _LM(), "cpu"))
+        text, _ = llm._local_complete_once(
+            model=self.MODEL, system=None, prompt="q", schema={"type": "object"},
+            max_tokens=16, temperature=0.0,
+        )
+        assert json.loads(text) == {"ok": True}
+
+    def test_input_truncation_is_reported_not_silent(self, monkeypatch):
+        """A local model has a hard context window and — unlike an API — no
+        server-side error when you exceed it; it just produces worse output. So
+        the truncation must surface on the usage record, where the schema-retry
+        loop and the caller can both see it."""
+        class _Tok:
+            pad_token_id = 0
+            pad_token = None
+            eos_token = "</s>"
+            def apply_chat_template(self, m, tokenize=False, add_generation_prompt=True): return "P"
+            def __call__(self, text, return_tensors=None, truncation=None, max_length=None):
+                import torch
+                assert truncation is True, "prompt must be truncated, never sent over-length"
+                # Simulate the tokenizer clamping to max_length.
+                return {"input_ids": torch.zeros((1, max_length), dtype=torch.long)}
+            def decode(self, ids, skip_special_tokens=True): return "answer"
+
+        class _LM:
+            device = "cpu"
+            def generate(self, **kwargs):
+                import torch
+                return torch.zeros((1, kwargs["input_ids"].shape[-1] + 3), dtype=torch.long)
+
+        monkeypatch.setattr(llm, "_get_local_model", lambda hf_id: (_Tok(), _LM(), "cpu"))
+        monkeypatch.setenv(llm.LOCAL_MAX_INPUT_TOKENS_ENV, "128")
+        _text, usage = llm._local_complete_once(
+            model=self.MODEL, system=None, prompt="x " * 10_000, schema=None,
+            max_tokens=32, temperature=0.0,
+        )
+        assert usage.prompt_tokens == 128
+        assert usage.truncated is True
+
+    def test_completion_hitting_max_tokens_is_also_flagged(self, monkeypatch):
+        class _Tok:
+            pad_token_id = 0
+            pad_token = None
+            eos_token = "</s>"
+            def apply_chat_template(self, m, tokenize=False, add_generation_prompt=True): return "P"
+            def __call__(self, text, return_tensors=None, truncation=None, max_length=None):
+                import torch
+                return {"input_ids": torch.zeros((1, 4), dtype=torch.long)}
+            def decode(self, ids, skip_special_tokens=True): return "truncated output"
+
+        class _LM:
+            device = "cpu"
+            def generate(self, **kwargs):
+                import torch  # produced exactly max_new_tokens -> ran out of room
+                return torch.zeros((1, 4 + kwargs["max_new_tokens"]), dtype=torch.long)
+
+        monkeypatch.setattr(llm, "_get_local_model", lambda hf_id: (_Tok(), _LM(), "cpu"))
+        _text, usage = llm._local_complete_once(
+            model=self.MODEL, system=None, prompt="q", schema=None,
+            max_tokens=16, temperature=0.0,
+        )
+        assert usage.completion_tokens == 16
+        assert usage.truncated is True
+
+
+class TestLocalLoadPreflight:
+    """`_preflight_local_load` — the gate that stops a local model taking the
+    machine down.
+
+    Every test fakes the machine's RAM/VRAM rather than reading the real values,
+    so the suite asserts the DECISION RULE and cannot go flaky when the box it
+    runs on happens to be busy or idle."""
+
+    @staticmethod
+    def _fake_machine(monkeypatch, *, ram_gb: float, vram_gb: float | None):
+        monkeypatch.setattr(llm, "_available_ram_gb", lambda: ram_gb)
+        import torch
+
+        if vram_gb is None:
+            monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        else:
+            monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+            monkeypatch.setattr(
+                torch.cuda, "mem_get_info", lambda _i=0: (int(vram_gb * 1024**3), int(16 * 1024**3))
+            )
+        # Force the parameter-count fallback rather than a cached-snapshot read,
+        # so size comes from the model id and the test is hermetic.
+        monkeypatch.setattr(llm, "_dir_size_gb", lambda _p: 0.0)
+
+    def test_refuses_when_host_ram_is_the_binding_constraint(self, monkeypatch):
+        """The real 2026-08-18 failure: plenty of VRAM, not enough host RAM.
+        `from_pretrained` stages weights in host memory, so VRAM being free is
+        no protection at all."""
+        self._fake_machine(monkeypatch, ram_gb=1.0, vram_gb=15.0)
+        with pytest.raises(llm.LocalModelError) as exc:
+            llm._preflight_local_load("Qwen/Qwen2.5-7B-Instruct", "cuda", None)
+        msg = str(exc.value)
+        assert "host RAM" in msg
+        assert "1.0 GB is available" in msg
+
+    def test_refuses_when_vram_is_the_binding_constraint(self, monkeypatch):
+        self._fake_machine(monkeypatch, ram_gb=64.0, vram_gb=14.7)
+        with pytest.raises(llm.LocalModelError) as exc:
+            llm._preflight_local_load("Qwen/Qwen2.5-7B-Instruct", "cuda", None)
+        assert "VRAM" in str(exc.value)
+
+    def test_error_names_the_actionable_fix(self, monkeypatch):
+        """A refusal that does not say what to do next just moves the problem."""
+        self._fake_machine(monkeypatch, ram_gb=64.0, vram_gb=14.7)
+        with pytest.raises(llm.LocalModelError) as exc:
+            llm._preflight_local_load("Qwen/Qwen2.5-7B-Instruct", "cuda", None)
+        assert llm.LOCAL_QUANT_ENV in str(exc.value)
+
+    def test_8bit_makes_a_refused_model_fit(self, monkeypatch):
+        """The measured case: 7B fp16 needs ~15.5 GB and is refused; the same
+        model in 8-bit needs ~7.5 GB and is allowed."""
+        self._fake_machine(monkeypatch, ram_gb=64.0, vram_gb=14.7)
+        with pytest.raises(llm.LocalModelError):
+            llm._preflight_local_load("Qwen/Qwen2.5-7B-Instruct", "cuda", None)
+        llm._preflight_local_load("Qwen/Qwen2.5-7B-Instruct", "cuda", "8bit")  # must not raise
+
+    def test_small_model_on_a_healthy_machine_is_allowed(self, monkeypatch):
+        self._fake_machine(monkeypatch, ram_gb=12.0, vram_gb=14.7)
+        llm._preflight_local_load("Qwen/Qwen2.5-3B-Instruct", "cuda", None)
+
+    def test_cpu_device_skips_the_vram_check_but_not_the_ram_check(self, monkeypatch):
+        self._fake_machine(monkeypatch, ram_gb=1.0, vram_gb=None)
+        with pytest.raises(llm.LocalModelError) as exc:
+            llm._preflight_local_load("Qwen/Qwen2.5-7B-Instruct", "cpu", None)
+        assert "host RAM" in str(exc.value)
+        assert "VRAM" not in str(exc.value)
+
+    def test_escape_hatch_bypasses_everything(self, monkeypatch):
+        self._fake_machine(monkeypatch, ram_gb=0.1, vram_gb=0.1)
+        monkeypatch.setenv(llm.LOCAL_SKIP_PREFLIGHT_ENV, "1")
+        llm._preflight_local_load("Qwen/Qwen2.5-72B-Instruct", "cuda", None)
+
+    def test_unparseable_model_id_assumes_7b_rather_than_zero(self, monkeypatch):
+        """An unknown id must fail SAFE — assume something big — never assume 0 GB
+        and wave a 70B model through."""
+        self._fake_machine(monkeypatch, ram_gb=64.0, vram_gb=1.0)
+        with pytest.raises(llm.LocalModelError):
+            llm._preflight_local_load("some-org/mystery-model", "cuda", None)
+
+    def test_dir_size_counts_symlinked_blobs_once(self, tmp_path):
+        """A HuggingFace cache stores each weight once under `blobs/` and
+        symlinks it into `snapshots/`. Summing both reports exactly double,
+        which made this guard refuse a load that fit comfortably."""
+        blobs = tmp_path / "blobs"
+        snaps = tmp_path / "snapshots" / "abc"
+        blobs.mkdir(parents=True)
+        snaps.mkdir(parents=True)
+        payload = b"x" * (4 * 1024 * 1024)  # 4 MB
+        (blobs / "weight.bin").write_bytes(payload)
+        (snaps / "weight.bin").symlink_to(blobs / "weight.bin")
+
+        size_gb = llm._dir_size_gb(tmp_path)
+        expected_gb = len(payload) / 1024**3
+        assert size_gb == pytest.approx(expected_gb, rel=0.01), (
+            "symlinked blob counted more than once"
+        )
+
+    def test_bad_quant_value_is_rejected_with_the_valid_options(self, monkeypatch):
+        monkeypatch.setenv(llm.LOCAL_QUANT_ENV, "3bit")
+        with pytest.raises(llm.LocalModelError) as exc:
+            llm._get_local_model("Qwen/Qwen2.5-3B-Instruct")
+        assert "8bit" in str(exc.value) and "4bit" in str(exc.value)
+
+
+class TestPromptedSchemaRobustness:
+    """`_extract_json_object` / `_schema_skeleton` — the prompted-structured-output
+    path used by `local:` models.
+
+    OpenAI and Google constrain decoding to the schema; `transformers` does not,
+    so a local model is *asked* for JSON and mostly complies. The failures are
+    cosmetic — a markdown fence, a "Here is the JSON:" preamble, a trailing
+    sentence — but each one makes `json.loads` fail on otherwise-correct output,
+    burns the retry budget, and surfaces as a wrong answer. That is a measurement
+    error wearing a model error's clothes, which is exactly what this project's
+    eval discipline exists to prevent."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ('{"a": 1}', {"a": 1}),
+            ('```json\n{"a": 1}\n```', {"a": 1}),
+            ('```\n{"a": 1}\n```', {"a": 1}),
+            ('Here is the JSON:\n{"a": 1}', {"a": 1}),
+            ('{"a": 1}\n\nHope that helps!', {"a": 1}),
+            ('{"n": [{"x": 1}, {"x": 2}], "a": "y"}', {"n": [{"x": 1}, {"x": 2}], "a": "y"}),
+        ],
+    )
+    def test_recovers_json_from_common_wrappers(self, raw, expected):
+        assert json.loads(llm._extract_json_object(raw)) == expected
+
+    def test_braces_inside_strings_do_not_break_depth_counting(self):
+        """Clinical notes really do contain braces and quotes; a regex-based
+        extractor mis-slices on them."""
+        raw = '{"note": "gave {60 mg} then said \\"stop\\"", "ok": true}'
+        assert json.loads(llm._extract_json_object(raw)) == {
+            "note": 'gave {60 mg} then said "stop"',
+            "ok": True,
+        }
+
+    def test_unbalanced_output_is_returned_for_the_retry_loop_to_reject(self):
+        """A genuinely truncated object must still fail to parse — silently
+        repairing it would invent content the model never produced."""
+        raw = '{"notes": [{"session_id": "abc"'
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(llm._extract_json_object(raw))
+
+    def test_skeleton_mirrors_the_schema_shape(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "notes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "turn_ids": {"type": "array", "items": {"type": "integer"}},
+                            "relevant": {"type": "boolean"},
+                        },
+                    },
+                },
+                "answer": {"type": "string"},
+            },
+        }
+        skeleton = json.loads(llm._schema_skeleton(schema))
+        assert set(skeleton) == {"notes", "answer"}
+        assert isinstance(skeleton["notes"], list)
+        assert set(skeleton["notes"][0]) == {"turn_ids", "relevant"}
+        assert skeleton["notes"][0]["turn_ids"] == [0]
+        assert skeleton["notes"][0]["relevant"] is True

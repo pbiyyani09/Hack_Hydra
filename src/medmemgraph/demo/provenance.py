@@ -375,10 +375,21 @@ def render_chain(result: dict) -> str:
 
     edges = result.get("edges") or []
 
-    def _edge_between(newer_id: object, older_id: object) -> dict | None:
+    def _edge_between(newer_id: object, older_id: object) -> tuple[dict, bool] | None:
+        """`(edge, is_forward)` for the edge joining two adjacent chain nodes.
+
+        Checks BOTH orientations. `SUPERSEDES` is written newer->older, but
+        `graph/invalidate.py::apply` writes `CONTRADICTS` in BOTH directions
+        (an unresolved conflict has no winner, so neither claim gets to point at
+        the other unilaterally). A one-directional lookup therefore missed real
+        edges and rendered them as `--?-->` — which on camera reads as a broken
+        feature rather than as the honest "these two disagree" it actually is."""
         for edge in edges:
             if edge["src"] == newer_id and edge["dst"] == older_id:
-                return edge
+                return edge, True
+        for edge in edges:
+            if edge["src"] == older_id and edge["dst"] == newer_id:
+                return edge, False
         return None
 
     lines: list[str] = []
@@ -394,7 +405,113 @@ def render_chain(result: dict) -> str:
             lines.append(f'    turn {turn["session_id"]}/{turn["turn_id"]}: "{turn["text"]}"')
         if i + 1 < len(nodes):
             newer = nodes[i + 1]
-            edge = _edge_between(newer["id"], node["id"])
-            arrow = edge["type"] if edge else "?"
-            lines.append(f"  --{arrow}-->")
+            found = _edge_between(newer["id"], node["id"])
+            if found is None:
+                # Adjacent on the walked path but with no direct edge between
+                # them — say so, rather than printing a bare "?" that reads as
+                # a bug.
+                lines.append("  --(no direct edge)-->")
+            else:
+                edge, is_forward = found
+                lines.append(
+                    f"  --{edge['type']}-->" if is_forward else f"  <--{edge['type']}--"
+                )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# CLI — Beat 3 of demo/VIDEO_SCRIPT.md
+# ---------------------------------------------------------------------------
+
+
+def _build_parser() -> "argparse.ArgumentParser":
+    import argparse
+
+    return _configure(
+        argparse.ArgumentParser(
+            prog="python -m medmemgraph.demo.provenance",
+            description=(
+                "Walk a claim's SUPERSEDES/CONTRADICTS chain and print each version "
+                "with the dialogue turn that produced it. This is the shot a vector "
+                "store cannot take: an ordered, audited chain of revisions, not a "
+                "ranked list of nearest chunks."
+            ),
+        )
+    )
+
+
+def _configure(parser):
+    parser.add_argument("--patient", required=True, metavar="PATIENT_ID")
+    parser.add_argument(
+        "--claim",
+        type=int,
+        default=None,
+        help="claim id to walk. Omit to auto-pick a claim that HAS a chain — "
+        "which is what you want on camera, and avoids hand-copying an id.",
+    )
+    parser.add_argument(
+        "--predicate",
+        default=None,
+        help="when auto-picking, prefer a chain on this predicate "
+        "(e.g. CURRENT_DOSAGE_OF for a dose-change story)",
+    )
+    return parser
+
+
+def _autopick_claim(client, patient_id: str, predicate: str | None) -> int | None:
+    """Find a claim that actually has a SUPERSEDES chain.
+
+    The video script's prep step says to read a `claim_id` off the graph by
+    hand before recording. That is a step that can go wrong at 23:00, so it is
+    automated here — and it fails loudly rather than walking a claim with no
+    chain and printing an empty result that looks like a broken feature."""
+    rows = client.run(
+        "MATCH (a:Claim {patient_id: $p})-[:SUPERSEDES]->(b:Claim) "
+        "RETURN a.id AS id, a.predicate AS predicate",
+        p=patient_id,
+    )
+    if not rows:
+        return None
+    if predicate:
+        for row in rows:
+            if row.get("predicate") == predicate:
+                return int(row["id"])
+    return int(rows[0]["id"])
+
+
+def main(argv: list[str] | None = None) -> int:
+    import sys
+
+    from medmemgraph.hydra_client import HydraClient
+
+    args = _build_parser().parse_args(argv)
+    with HydraClient(transport="bolt") as client:
+        claim_id = args.claim
+        if claim_id is None:
+            claim_id = _autopick_claim(client, args.patient, args.predicate)
+            if claim_id is None:
+                print(
+                    f"patient {args.patient!r} has no SUPERSEDES chains — either it was "
+                    "never ingested, or nothing in its history was ever revised. "
+                    "Pick a patient with a dose change or a diagnosis update.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"(auto-picked claim {claim_id})\n")
+
+        result = provenance_chain(client, patient_id=args.patient, claim_id=claim_id)
+
+    if not result.get("nodes"):
+        print(
+            f"claim {claim_id} has no chain for patient {args.patient!r} "
+            "(wrong patient for this claim, or the claim does not exist)",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(render_chain(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

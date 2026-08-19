@@ -164,7 +164,12 @@ import numpy as np
 
 from medmemgraph.contracts import RetrieveItem
 from medmemgraph.eval import metrics
-from medmemgraph.graph.reranker import CrossEncoderReranker, NoopReranker, RerankerBackend
+from medmemgraph.graph.reranker import (
+    CrossEncoderReranker,
+    NoopReranker,
+    RerankerBackend,
+    reranker_from_env,
+)
 from medmemgraph.graph.vector_index import PatientIndex
 from medmemgraph.pipeline.loader import load_conversation, load_qa
 
@@ -369,6 +374,18 @@ def build_reranker(name: str) -> RerankerBackend:
     the load cost is measured and excluded from the timed per-item loop)."""
     if name == "noop":
         return NoopReranker()
+    if name == "env":
+        # The teammate's fine-tuned checkpoint, selected by $MEDMEMGRAPH_RERANKER
+        # (see graph/reranker.py::spec_from_env). Named as an arm here so the
+        # A/B against `noop` runs on exactly the same candidate pool as every
+        # registered model, with no code change when the checkpoint lands.
+        built = reranker_from_env()
+        if built is None:
+            raise ValueError(
+                "reranker arm 'env' requested but $MEDMEMGRAPH_RERANKER is unset/off — "
+                "point it at a checkpoint directory or drop 'env' from --rerankers"
+            )
+        return built
     return CrossEncoderReranker(name)
 
 
@@ -889,3 +906,79 @@ def write_report(sweep: SweepResult, *, out_dir: Path = Path("results")) -> dict
     summary_path.write_text(summary_text, encoding="utf-8")
     paths["summary"] = summary_path
     return paths
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_arg_parser() -> "argparse.ArgumentParser":
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="python -m medmemgraph.eval.retrieval_eval",
+        description=(
+            "Retrieval IR sweep: Recall@k for the bi-encoder stage, Hit@k/nDCG@k after "
+            "reranking, plus a paired reranker-vs-noop test. Runs entirely on local "
+            "models against the corpus — NO API key, NO HydraDB, NO LLM spend."
+        ),
+    )
+    p.add_argument("--patients", nargs="+", required=True, help="subject ids to sweep")
+    p.add_argument(
+        "--embedders",
+        nargs="+",
+        default=list(EMBEDDERS),
+        help=f"bi-encoder arms (default: {' '.join(EMBEDDERS)})",
+    )
+    p.add_argument(
+        "--rerankers",
+        nargs="+",
+        default=list(RERANKERS),
+        help=(
+            f"reranker arms (default: {' '.join(RERANKERS)}). 'noop' is the control; "
+            "'env' uses the checkpoint named by $MEDMEMGRAPH_RERANKER."
+        ),
+    )
+    p.add_argument(
+        "--n-candidates",
+        type=int,
+        default=N_CANDIDATES_FOR_RERANK,
+        help=(
+            f"bi-encoder pool handed to the reranker (default: {N_CANDIDATES_FOR_RERANK}). "
+            "That default was measured on a GPU; lower it for a CPU-latency-honest run."
+        ),
+    )
+    p.add_argument("--root", default=None, help="corpus root (default: $MEDLOCOMO_ROOT or data/medlocomo)")
+    p.add_argument("--out", default="results", help="directory for the markdown reports")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    import sys
+
+    args = build_arg_parser().parse_args(argv)
+    sweep = run_sweep(
+        args.patients,
+        embedders_=tuple(args.embedders),
+        rerankers_=tuple(args.rerankers),
+        n_candidates=args.n_candidates,
+        root=args.root,
+    )
+    print(render_terminal_summary(sweep))
+    written = write_report(sweep, out_dir=Path(args.out))
+    for label, path in written.items():
+        print(f"wrote {label}: {path}")
+    # Stated, not buried: this sweep scores against the bi-encoder pool alone,
+    # while the live read path reranks the RRF-fused dense+lexical pool. The
+    # numbers here are therefore a LOWER BOUND on the live gain.
+    print(
+        "\nnote: scored against the bi-encoder candidate pool; the live read path reranks "
+        "the RRF-fused dense+lexical pool, so these are a lower bound on the live gain.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

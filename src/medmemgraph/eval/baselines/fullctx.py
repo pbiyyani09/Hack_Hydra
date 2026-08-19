@@ -24,10 +24,11 @@ from __future__ import annotations
 import os
 import time
 
+from medmemgraph import llm
 from medmemgraph.eval.types import AnswerResult, estimate_tokens
 from medmemgraph.pipeline.loader import Conversation
 
-DEFAULT_MODEL = os.environ.get("MEDMEMGRAPH_ANSWERER_MODEL", "claude-haiku-4-5")
+DEFAULT_MODEL = os.environ.get("MEDMEMGRAPH_ANSWERER_MODEL", llm.ANSWER_MODEL)
 
 _SYSTEM_PROMPT = (
     "You are a clinical question-answering assistant with FULL access to "
@@ -69,16 +70,22 @@ class FullContextAnswerer:
         self.context_budget_tokens = max(
             1_000, context_window_tokens - _RESERVED_TOKENS - max_tokens
         )
+        # Inert; see nomem.py's note. Real calls go through `llm.complete()`.
         self._client = client
-        if not dry_run and self._client is None:
-            import anthropic
-
-            self._client = anthropic.Anthropic()
 
     def answer(
-        self, question: str, conversation: Conversation | None, *, patient_id: str
+        self,
+        question: str,
+        conversation: Conversation | None,
+        *,
+        patient_id: str,
+        scope: str | None = None,
+        question_type: str | None = None,
     ) -> AnswerResult:
         del patient_id
+        # Accepted for Answerer-protocol parity; this system does no
+        # retrieval, so there is no router for the gold labels to reach.
+        del scope, question_type
         context_text, truncated, turns_dropped, tokens_dropped = self._build_context(
             conversation
         )
@@ -91,21 +98,18 @@ class FullContextAnswerer:
         user_content = (
             f"PATIENT HISTORY (oldest first):\n{context_text}\n\nQUESTION: {question}"
         )
-        start = time.monotonic()
-        response = self._client.messages.create(
+        response = llm.complete(
+            user_content,
             model=self.model,
-            max_tokens=self.max_tokens,
             system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_content}],
+            max_tokens=self.max_tokens,
+            temperature=0.0,
         )
-        latency_ms = (time.monotonic() - start) * 1000.0
-        text = next((b.text for b in response.content if b.type == "text"), "")
-        usage = response.usage
         return AnswerResult(
-            text=text,
-            prompt_tokens=usage.input_tokens,
-            completion_tokens=usage.output_tokens,
-            latency_ms=latency_ms,
+            text=response.text,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+            latency_ms=response.latency_ms,
             truncated=truncated,
             turns_dropped=turns_dropped,
             tokens_dropped=tokens_dropped,

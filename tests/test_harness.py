@@ -17,7 +17,11 @@ from __future__ import annotations
 
 import json
 
+from pathlib import Path
+
 import pytest
+
+from medmemgraph import llm
 
 from medmemgraph.eval.baselines.fullctx import FullContextAnswerer
 from medmemgraph.eval.baselines.nomem import NoMemoryAnswerer
@@ -365,11 +369,49 @@ class TestTruncationRecorded:
 
 
 class TestNoApiKeyFailsLoudly:
-    def test_evaluate_without_dry_run_and_without_api_key_raises(
+    """A non-dry-run system with no usable provider key must fail before it
+    answers a single item.
+
+    Rewritten 2026-08-17. The old version asserted a pre-flight on
+    `ANTHROPIC_API_KEY`, which had become wrong in two directions at once: it
+    demanded an Anthropic key for ALL SIX registered systems even though every
+    one of them now routes through `llm.complete()` to OpenAI/Google, and
+    because `main()` catches this error and prints `skipping <system>`, a real
+    run emitted six skip lines, wrote zero result files, and exited 0 — a
+    silent no-op that looked exactly like success.
+
+    The check is now provider-aware: it resolves the key for the model the
+    system will actually call."""
+
+    def test_evaluate_without_dry_run_and_without_a_usable_key_raises(
         self, monkeypatch, small_conversation, qa_items_all_categories
     ):
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+        # Blank every key source `llm` consults — env names for both providers
+        # AND the repo `.env` (which really does carry live keys).
+        for var in ("OPENAI_API_KEY", "OPEN_AI_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(llm, "_DEFAULT_DOTENV_PATH", Path("/nonexistent/.env"))
+
+        with pytest.raises(RuntimeError, match="provider key"):
+            evaluate(
+                qa_items_all_categories,
+                small_conversation,
+                patient_id="fixture-1",
+                system_name="nomem",
+                dry_run=False,
+            )
+
+    def test_an_anthropic_key_alone_is_no_longer_treated_as_sufficient(
+        self, monkeypatch, small_conversation, qa_items_all_categories
+    ):
+        """The inverse of the old bug: ANTHROPIC_API_KEY being set must not let a
+        run proceed, because nothing in this project calls Anthropic any more."""
+        for var in ("OPENAI_API_KEY", "OPEN_AI_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-irrelevant")
+        monkeypatch.setattr(llm, "_DEFAULT_DOTENV_PATH", Path("/nonexistent/.env"))
+
+        with pytest.raises(RuntimeError, match="provider key"):
             evaluate(
                 qa_items_all_categories,
                 small_conversation,

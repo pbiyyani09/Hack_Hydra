@@ -1,15 +1,23 @@
 """graph/writer.py — parameterized `UNWIND` writer for minted `ClinicalFact`s
 (ARCHITECTURE.md §6.5, decisions/003, stories/E4/E4-S4.md).
 
-Write order for one batch (ARCHITECTURE §6.5): vertices first (one label at
-a time — `Patient`, `Admission`, `Claim`, then each domain-entity label),
-then edges (`ADMITTED`, `HAS`, `ABOUT`). `SUPERSEDES` / `CONTRADICTS` and
-`DRAWN_FROM`/`:Turn` (invalidation-by-closing, §6.6) are out of scope here —
-E4-S5. `ClinicalFact` carries `turn_ids` (bare ints) but not the `speaker` /
-`occurred_at` / `raw_text` a `:Turn` node requires (§5.1); writing a `:Turn`
-node without them would leave a contract-violating stub, so this module does
-not create `:Turn` nodes or `DRAWN_FROM` edges — a Pipeline story that also
-has the source `Conversation` object is the natural owner of that edge.
+Two entry points, deliberately separate because they need different inputs:
+
+`write_facts(client, facts, id_map)` — write order for one batch
+(ARCHITECTURE §6.5): vertices first (one label at a time — `Patient`,
+`Admission`, `Claim`, then each domain-entity label), then edges (`ADMITTED`,
+`HAS`, `ABOUT`). `SUPERSEDES` / `CONTRADICTS` remain out of scope here
+(invalidation-by-closing, §6.6, lives in `graph/invalidate.py`).
+
+`write_turns(client, conversation, facts, id_map)` — the `:Turn` provenance
+layer (`:Turn` nodes, `CONTAINS`, `DRAWN_FROM`), added 2026-08-17. It is a
+separate function rather than part of `write_facts` because `ClinicalFact`
+carries `turn_ids` (bare ints) but not the `speaker` / `occurred_at` /
+`raw_text` a `:Turn` node requires (§5.1) — only a caller holding the source
+`Conversation` can supply those, so `write_facts` structurally cannot write
+this layer without emitting contract-violating stubs. `pipeline/ingest.py`
+holds both and calls both, in that order (`DRAWN_FROM` MATCHes `:Claim`
+endpoints, which must therefore already exist).
 
 --------------------------------------------------------------------------
 Executed-verified live-engine correction to ARCHITECTURE.md §6.5's own copy
@@ -47,6 +55,7 @@ the full reproduction):
 from __future__ import annotations
 
 import time
+from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -56,6 +65,7 @@ from medmemgraph.contracts import ClinicalFact
 from medmemgraph.graph import schema
 from medmemgraph.hydra_client import HydraClient
 from medmemgraph.pipeline.ids import IdMap, IdMinter, mint_claim_id, mint_patient_id
+from medmemgraph.pipeline.loader import Conversation
 
 MAX_BATCH_SIZE = 1000
 """Hard ceiling on rows per `UNWIND $rows` statement (ARCHITECTURE §6.5:
@@ -99,6 +109,35 @@ class WriteReport:
         if self.wall_clock_s <= 0:
             return 0.0
         return self.rows_written / self.wall_clock_s
+
+    @property
+    def total_skip(self) -> bool:
+        """True iff facts went in and NOTHING was written.
+
+        A *partial* skip is a bad row and is correctly recorded-not-raised (see
+        `write_facts`). A *total* skip is categorically different: it means every
+        fact violated the same contract, i.e. a systematic upstream defect, and
+        it is indistinguishable from success at a glance because `write_facts`
+        returns normally with an empty graph behind it. That is exactly how the
+        entity-type drift went unnoticed until 2026-08-17 — real runs wrote zero
+        facts and reported no error.
+
+        `write_facts` still does not raise on this (one tested contract: a caller
+        bypassing Pipeline's extraction/ER contract gets a recorded skip). The
+        production entry point `pipeline.ingest.ingest_patient` checks this and
+        raises."""
+        return self.facts_in > 0 and self.facts_written == 0
+
+    def skip_summary(self, limit: int = 5) -> str:
+        """Distinct skip reasons with counts — what a human needs to see to fix
+        the cause, rather than `facts_skipped=1738` with no reason attached."""
+        counts = Counter(problem for _fact_id, problems in self.skipped for problem in problems)
+        if not counts:
+            return "(no recorded skip reasons)"
+        lines = [f"{n} x {reason}" for reason, n in counts.most_common(limit)]
+        if len(counts) > limit:
+            lines.append(f"... and {len(counts) - limit} more distinct reason(s)")
+        return "; ".join(lines)
 
 
 class WriterError(RuntimeError):
@@ -159,6 +198,28 @@ _PATIENT_SET_CLAUSES = "n.patient_id = row.patient_id"
 _ADMISSION_SET_CLAUSES = "n.session_id = row.session_id, n.patient_id = row.patient_id"
 _ENTITY_SET_CLAUSES = "n.name = row.name, n.type = row.type"
 _EDGE_SET_CLAUSES = "r.observed_at = row.observed_at"
+
+TURN_PROPERTIES = ("id", "session_id", "turn_id", "speaker", "occurred_at", "raw_text")
+"""`:Turn` properties (ARCHITECTURE §5.1).
+
+`session_id`, `turn_id` and `raw_text` are named by `demo/provenance.py`'s own
+`MATCH (c:Claim {id:$cid})-[:DRAWN_FROM]->(t:Turn) RETURN t.session_id, t.turn_id,
+t.raw_text` — rename any of the three and the provenance walk returns rows of
+nulls. Note `turn_id`, not the loader's `turn_number`, and `raw_text`, not
+`text`."""
+
+_TURN_SET_CLAUSES = ", ".join(
+    f"n.{prop} = row.{prop}" for prop in TURN_PROPERTIES if prop != "id"
+)
+
+
+def turn_identity_key(patient_id: str, session_id: str, turn_number: int) -> str:
+    """Identity key for a `:Turn` node id (§5.4: deterministic, never a counter).
+
+    Scoped by patient AND admission, not by turn number alone — turn numbers
+    restart per admission, so `Turn|<n>` would collapse turn 1 of every admission
+    of every patient onto one node."""
+    return f"Turn|{patient_id}|{session_id}|{turn_number}"
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +406,144 @@ def write_facts(
     for dst_label, edges in about_edges_by_label.items():
         _write_edge_batches("ABOUT", "Claim", dst_label, edges.values())
 
+    report.wall_clock_s = time.monotonic() - start
+    return report
+
+
+def write_turns(
+    client: HydraClient,
+    conversation: Conversation,
+    facts: Iterable[ClinicalFact] = (),
+    id_map: IdMap | IdMinter | None = None,
+    *,
+    batch_size: int = 1000,
+) -> WriteReport:
+    """Write the `:Turn` provenance layer: `:Turn` nodes,
+    `(:Admission)-[:CONTAINS]->(:Turn)`, and `(:Claim)-[:DRAWN_FROM]->(:Turn)`.
+
+    Separate from `write_facts` because it needs source material `write_facts`
+    cannot see: `ClinicalFact` carries bare `turn_ids: list[int]` but not the
+    `speaker`/`occurred_at`/`raw_text` a `:Turn` node requires (§5.1), so only a
+    caller holding the `Conversation` can write this layer. `write_facts`'s own
+    docstring anticipated exactly this ("a Pipeline story that also has the
+    source `Conversation` object is the natural owner of that edge"); this is
+    that owner, called from `pipeline.ingest.ingest_patient`.
+
+    **Call this AFTER `write_facts`.** `DRAWN_FROM` is an edge upsert, which
+    `MATCH`es its endpoints — a `:Claim` that does not exist yet silently matches
+    nothing and the edge is never created, with no error. `:Admission` nodes are
+    re-`MERGE`d here (idempotent, same minted id) so that an admission which
+    yielded no facts still gets its `CONTAINS` edges.
+
+    `id_map` MUST be the same map/minter `write_facts` used for this patient, or
+    `mint_claim_id` re-derives a different `:Claim` id and every `DRAWN_FROM`
+    edge silently matches nothing. `ingest_patient` threads one minter through
+    both calls.
+
+    Without this layer `demo/provenance.py::provenance_chain` returns
+    `turns: []` for every claim — the "here is the sentence that produced this
+    version of the fact" half of the provenance walk has nothing behind it.
+    """
+    effective_batch_size = min(batch_size, MAX_BATCH_SIZE)
+    if effective_batch_size <= 0:
+        raise ValueError(f"write_turns: batch_size must be positive, got {batch_size}")
+
+    minter: IdMinter = id_map if isinstance(id_map, IdMinter) else IdMinter(id_map)
+    patient_id = conversation.subject_id
+    report = WriteReport()
+    start = time.monotonic()
+
+    turns: dict[int, dict[str, Any]] = {}
+    admissions: dict[int, dict[str, Any]] = {}
+    contains_edges: dict[int, dict[str, Any]] = {}
+    # (session_id, turn_number) -> minted Turn node id, so DRAWN_FROM can resolve
+    # a fact's bare turn_ids back to real nodes.
+    turn_ids_by_key: dict[tuple[str, int], int] = {}
+
+    for turn in conversation.turns():
+        turn_node_id = minter.mint(turn_identity_key(patient_id, turn.hadm_id, turn.turn_number))
+        turn_ids_by_key[(turn.hadm_id, turn.turn_number)] = turn_node_id
+        turns[turn_node_id] = {
+            "vertex": turn_node_id,
+            "session_id": turn.hadm_id,
+            "turn_id": turn.turn_number,
+            "speaker": turn.speaker,
+            "occurred_at": turn.time,
+            "raw_text": turn.text,
+        }
+
+        admission_node_id = minter.mint(f"Admission|{turn.hadm_id}")
+        admissions[admission_node_id] = {
+            "vertex": admission_node_id,
+            "session_id": turn.hadm_id,
+            "patient_id": patient_id,
+        }
+        contains_edge_id = minter.mint(f"CONTAINS|{turn.hadm_id}|{turn.turn_number}")
+        contains_edges[contains_edge_id] = {
+            "source_vertex": admission_node_id,
+            "destination_vertex": turn_node_id,
+            "relationship_vertex": contains_edge_id,
+            "observed_at": turn.time,
+        }
+
+    report.facts_in = len(turns)
+
+    drawn_from_edges: dict[int, dict[str, Any]] = {}
+    for fact in facts:
+        claim_node_id = mint_claim_id(fact.fact_id, id_map=minter)
+        for turn_number in fact.turn_ids:
+            turn_node_id = turn_ids_by_key.get((fact.session_id, turn_number))
+            if turn_node_id is None:
+                # A fact citing a turn that is not in this conversation. Recorded,
+                # not raised: one dangling citation must not sink the layer, but
+                # it must not vanish either — an edge silently not created is how
+                # a provenance walk ends up empty for no visible reason.
+                report.skipped.append(
+                    (fact.fact_id, [f"turn {turn_number} not found in session {fact.session_id}"])
+                )
+                continue
+            edge_id = minter.mint(f"DRAWN_FROM|{fact.fact_id}|{turn_number}")
+            drawn_from_edges[edge_id] = {
+                "source_vertex": claim_node_id,
+                "destination_vertex": turn_node_id,
+                "relationship_vertex": edge_id,
+                "observed_at": fact.observed_at,
+            }
+
+    _run_batches(
+        client,
+        _vertex_upsert_cypher("Admission", _ADMISSION_SET_CLAUSES),
+        list(admissions.values()),
+        effective_batch_size,
+        report,
+        is_edge=False,
+    )
+    _run_batches(
+        client,
+        _vertex_upsert_cypher("Turn", _TURN_SET_CLAUSES),
+        list(turns.values()),
+        effective_batch_size,
+        report,
+        is_edge=False,
+    )
+    _run_batches(
+        client,
+        _edge_upsert_cypher("CONTAINS", "Admission", "Turn", _EDGE_SET_CLAUSES),
+        list(contains_edges.values()),
+        effective_batch_size,
+        report,
+        is_edge=True,
+    )
+    _run_batches(
+        client,
+        _edge_upsert_cypher("DRAWN_FROM", "Claim", "Turn", _EDGE_SET_CLAUSES),
+        list(drawn_from_edges.values()),
+        effective_batch_size,
+        report,
+        is_edge=True,
+    )
+
+    report.facts_written = len(turns)
     report.wall_clock_s = time.monotonic() - start
     return report
 

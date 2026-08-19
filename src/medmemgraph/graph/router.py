@@ -194,11 +194,21 @@ def route_eval(
 # ---------------------------------------------------------------------------
 
 _GRAPH_KEYWORD_RE = re.compile(
-    r"compar|progress|over time|how often|how many times|across admission|since (?:the|her|his|my) last",
+    r"compar|progress|over time|how often|how many times|across admission"
+    r"|between (?:the )?(?:two |both )?admission|between (?:the )?(?:two |both )?(?:stay|visit)"
+    r"|since (?:the|her|his|my) last",
     re.IGNORECASE,
 )
 """ARCHITECTURE §7.1's own live heuristic: "comparison / progression / "over
 time" / "how often" / "how many times" / "compared to last admission"".
+
+`between ... admission(s)/stay(s)/visit(s)` added 2026-08-18: the ARCHITECTURE
+list covers "across admission" but not "between admissions", and "between" is
+the more natural phrasing — `demo/VIDEO_SCRIPT.md`'s OWN example question ("Did
+the furosemide dose change between the two admissions?") missed the pattern and
+routed to `hybrid`. This heuristic only runs at demo time (`route_live`);
+evaluation uses the benchmark's gold `scope`/`question_type` labels via
+`route_eval`, so no reported number depends on it.
 `compar` (not `comparison`/`compared`) and `progress` (not `progression`)
 are deliberately truncated stems so both noun and verb forms match; `across
 admission` matches "across admissions" as a substring (AC4's own worked

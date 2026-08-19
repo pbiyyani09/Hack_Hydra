@@ -30,6 +30,7 @@ import argparse
 import inspect
 import json
 import os
+import random
 import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -37,10 +38,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from medmemgraph import llm
+from medmemgraph.eval.baselines.dense import DenseRAGAnswerer
 from medmemgraph.eval.baselines.fullctx import FullContextAnswerer
+from medmemgraph.eval.baselines.lexical import LexicalAnswerer
 from medmemgraph.eval.baselines.nomem import NoMemoryAnswerer
 from medmemgraph.eval.judge import Judge
-from medmemgraph.eval.reader import ReaderChainOfNoteAnswerer, ReaderDirectAnswerer
+from medmemgraph.eval.reader import (
+    MedMemGraphAnswerer,
+    ReaderChainOfNoteAnswerer,
+    ReaderDirectAnswerer,
+)
 from medmemgraph.eval.types import Answerer
 from medmemgraph.pipeline.loader import Conversation, load_conversation, load_qa
 
@@ -49,10 +57,13 @@ from medmemgraph.pipeline.loader import Conversation, load_conversation, load_qa
 # ---------------------------------------------------------------------------
 
 SYSTEM_FACTORIES: dict[str, Callable[..., Answerer]] = {
-    NoMemoryAnswerer.name: NoMemoryAnswerer,
-    FullContextAnswerer.name: FullContextAnswerer,
+    NoMemoryAnswerer.name: NoMemoryAnswerer,              # rung 1
+    FullContextAnswerer.name: FullContextAnswerer,        # rung 2
+    DenseRAGAnswerer.name: DenseRAGAnswerer,              # rung 3
+    LexicalAnswerer.name: LexicalAnswerer,                # rung 4
     ReaderDirectAnswerer.name: ReaderDirectAnswerer,
     ReaderChainOfNoteAnswerer.name: ReaderChainOfNoteAnswerer,
+    MedMemGraphAnswerer.name: MedMemGraphAnswerer,    # the headline system
 }
 """Registered baseline systems, keyed by name. Add a new baseline here to
 make it runnable by name from the CLI / evaluate(). `reader_direct` /
@@ -121,6 +132,11 @@ class HarnessRun:
     answerable_accuracy: float | None
     abstention_accuracy: float | None
     n_truncated: int
+    stratify_per_type: int | None = None
+    seed: int | None = None
+    """How this run's items were sampled. Recorded so a results file states its
+    own provenance: a per-category table means something different at
+    `stratify_per_type=8` than at an unstratified `--k 20`."""
     records: list[Record] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -180,6 +196,43 @@ def _aggregate(
 # ---------------------------------------------------------------------------
 
 
+
+def stratified_sample(
+    qa_items: list[dict], per_type: int, *, seed: int = 0
+) -> list[dict]:
+    """Up to `per_type` items from EACH `question_type`, deterministically.
+
+    `--k` slices the first N items of an unshuffled corpus, so `--k 20` can
+    hand back twenty `medical_reasoning` items and zero `adversarial` ones —
+    it cannot produce the per-category table this harness exists to print, and
+    it cannot produce an abstention row at all.
+
+    Deterministic by `seed` (default 0) and recorded on the run, because every
+    system must be scored on the SAME items: `metrics.mcnemar_test` and
+    `report._align_by_qa_id` are both paired per `qa_id`, so two systems drawing
+    different samples silently reduces to comparing different benchmarks.
+
+    Selection is by sorted `qa_id` within each type, then seeded-shuffled — not
+    corpus order — so the draw does not inherit whatever ordering the corpus
+    happens to ship with.
+    """
+    if per_type <= 0:
+        return []
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for item in qa_items:
+        buckets[item.get("question_type", "unknown")].append(item)
+
+    picked: list[dict] = []
+    for qtype in sorted(buckets):
+        group = sorted(buckets[qtype], key=lambda it: str(it.get("qa_id", "")))
+        rng = random.Random(f"{seed}:{qtype}")
+        rng.shuffle(group)
+        picked.extend(group[:per_type])
+    # Stable output order so results files diff cleanly between runs.
+    picked.sort(key=lambda it: (str(it.get("question_type", "")), str(it.get("qa_id", ""))))
+    return picked
+
+
 def evaluate(
     qa_items: list[dict],
     conversation: Conversation | None,
@@ -190,6 +243,8 @@ def evaluate(
     answerer_model: str | None = None,
     judge_model: str | None = None,
     k: int | None = None,
+    stratify_per_type: int | None = None,
+    seed: int = 0,
     rendering: str | None = None,
     retrieve_k: int | None = None,
     answerer: Answerer | None = None,
@@ -205,7 +260,9 @@ def evaluate(
     `reader_con` systems (eval/reader.py) — harmlessly ignored for
     `nomem`/`fullctx`, which do not accept those constructor kwargs (see
     `_build_answerer`'s signature-introspection guard)."""
-    if k is not None:
+    if stratify_per_type is not None:
+        qa_items = stratified_sample(qa_items, stratify_per_type, seed=seed)
+    elif k is not None:
         qa_items = qa_items[:k]
 
     if answerer is None:
@@ -221,7 +278,13 @@ def evaluate(
 
     records: list[Record] = []
     for item in qa_items:
-        result = answerer.answer(item["question"], conversation, patient_id=patient_id)
+        result = answerer.answer(
+            item["question"],
+            conversation,
+            patient_id=patient_id,
+            scope=item.get("scope"),
+            question_type=item.get("question_type"),
+        )
         verdict = judge.judge(
             question=item["question"],
             gold_answer=item["answer"],
@@ -260,6 +323,8 @@ def evaluate(
         answerable_accuracy=_accuracy(answerable),
         abstention_accuracy=_accuracy(adversarial) if adversarial else None,
         n_truncated=sum(1 for r in records if r.truncated),
+        stratify_per_type=stratify_per_type,
+        seed=seed if stratify_per_type is not None else None,
         records=records,
     )
 
@@ -277,12 +342,27 @@ def _build_answerer(
         raise ValueError(
             f"unknown system {system_name!r}; known systems: {sorted(SYSTEM_FACTORIES)}"
         )
-    if not dry_run and not os.environ.get("ANTHROPIC_API_KEY"):
-        raise RuntimeError(
-            f"system {system_name!r} is an LLM baseline and needs ANTHROPIC_API_KEY to "
-            "call the Anthropic API. Set it in .env, or pass --dry-run to exercise the "
-            "harness with a stub answerer and no API calls."
-        )
+    if not dry_run:
+        # Pre-flight the key for the model this system will actually call, rather
+        # than probing one hardcoded provider env var. The old check demanded
+        # ANTHROPIC_API_KEY for ALL FOUR systems even though the reader systems
+        # had already been rewired onto OpenAI via `llm.complete` — and because
+        # `main()` catches this and prints "skipping <system>", a real run
+        # produced four skip lines, zero result files, and exit code 0. Silent
+        # no-op, indistinguishable from success (fixed 2026-08-17).
+        #
+        # Failing here rather than at the first API call keeps the error cheap
+        # and specific: it names the model and the system before any QA item is
+        # answered or any token is spent.
+        probe_model = model or getattr(factory, "default_model", None) or llm.ANSWER_MODEL
+        try:
+            llm.resolve_key_for_model(probe_model)
+        except llm.LLMError as exc:
+            raise RuntimeError(
+                f"system {system_name!r} needs a provider key for model {probe_model!r} "
+                f"and none is configured: {exc}. Set it in .env, or pass --dry-run to "
+                "exercise the harness with a stub answerer and no API calls."
+            ) from exc
     kwargs: dict = {"dry_run": dry_run}
     if model:
         kwargs["model"] = model
@@ -378,12 +458,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patient", required=True, help="MedLoCoMo subject_id")
     parser.add_argument(
         "--system",
-        action="append",
+        action="extend",
+        nargs="+",
         choices=sorted(SYSTEM_FACTORIES),
         help="baseline system to run (repeatable); default: all registered systems",
     )
     parser.add_argument("--root", default=None, help="MedLoCoMo corpus root (default: $MEDLOCOMO_ROOT or data/medlocomo)")
-    parser.add_argument("--k", type=int, default=None, help="limit to the first N QA items (smoke testing)")
+    parser.add_argument("--k", type=int, default=None, help="limit to the FIRST N QA items (smoke testing only — not stratified, so it cannot produce a per-category table)")
+    parser.add_argument(
+        "--stratify-per-type",
+        type=int,
+        default=None,
+        help="sample up to N items per question_type (deterministic). Use this, not --k, "
+             "for any run whose numbers get reported.",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="sampling seed (recorded in the results file)")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -411,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     systems = args.system or list(SYSTEM_FACTORIES)
 
+    skipped: list[str] = []
     for system_name in systems:
         try:
             run = run_harness(
@@ -419,6 +509,8 @@ def main(argv: list[str] | None = None) -> int:
                 root=args.root,
                 dry_run=args.dry_run,
                 k=args.k,
+                stratify_per_type=args.stratify_per_type,
+                seed=args.seed,
                 answerer_model=args.answerer_model,
                 judge_model=args.judge_model,
                 rendering=args.rendering,
@@ -426,12 +518,23 @@ def main(argv: list[str] | None = None) -> int:
             )
         except RuntimeError as exc:
             print(f"skipping {system_name}: {exc}", file=sys.stderr)
+            skipped.append(system_name)
             continue
         print(render_run(run))
         path = write_results(run, args.results_dir)
         print(f"wrote {path}")
         print()
 
+    if skipped:
+        # Exit non-zero. Previously every system could be skipped and this
+        # returned 0 with no output files written — a silent no-op that reads
+        # exactly like a successful run, which is how the ANTHROPIC_API_KEY gate
+        # went unnoticed for so long.
+        print(
+            f"{len(skipped)}/{len(systems)} system(s) produced NO results: {', '.join(skipped)}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

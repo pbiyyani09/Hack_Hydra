@@ -109,8 +109,19 @@ class Answerer(Protocol):
     name: str
 
     def answer(
-        self, question: str, conversation: Conversation | None, *, patient_id: str
+        self,
+        question: str,
+        conversation: Conversation | None,
+        *,
+        patient_id: str,
+        scope: str | None = None,
+        question_type: str | None = None,
     ) -> AnswerResult: ...
+    """`scope` / `question_type` are the benchmark's own gold labels for the
+    item. Retrieval-backed systems forward them so `router.route_eval` (the
+    frozen rule under test) runs instead of `route_live`'s demo-time keyword
+    heuristic; systems that do no retrieval ignore them. Optional so an
+    implementation that predates them still satisfies the protocol."""
 
 
 # ---------------------------------------------------------------------------

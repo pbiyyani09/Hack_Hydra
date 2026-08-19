@@ -21,6 +21,8 @@ dependencies = [
     "openinference-instrumentation-openai>=0.1.54",
     "openinference-instrumentation-google-genai>=1.4.0",
     "optimum[onnxruntime]>=2.1.0",
+    "accelerate>=1.14.0",
+    "bitsandbytes>=0.50.1",
 ]
 
 [project.optional-dependencies]

@@ -88,9 +88,12 @@ placeholders, before submitting.
       full argument.
 - [ ] **Tech stack:** HydraDB OSS `0.1.1` (Rust, AGPL-3.0, self-hosted),
       Python 3.13, `neo4j==5.28.2` (patched client), `uv`, NumPy
-      brute-force cosine, `bm25s`, Anthropic API (extraction, Chain-of-Note
-      reading, LLM judge, with deterministic fallbacks when no key is
-      configured).
+      brute-force cosine, `bm25s`, `sentence-transformers` (Qwen3-Embedding-0.6B),
+      OpenAI `gpt-4.1-mini` (Chain-of-Note reading) and Google
+      `gemini-3.5-flash-lite` (extraction, LLM judge, entity-match
+      adjudication) — deliberately different model families so the judge
+      never grades its own answerer. Deterministic offline fallbacks exist
+      behind an explicit `--dry-run`, never as a silent default.
 - [ ] **Team:** fill in actual names/roles before filing; do not leave
       this checklist's placeholder text in the form.
 - [ ] **GitHub link:** `https://github.com/pbiyyani09/Hack_Hydra`

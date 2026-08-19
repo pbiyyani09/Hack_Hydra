@@ -52,7 +52,7 @@ from dataclasses import dataclass
 
 from medmemgraph.contracts import ClinicalFact
 from medmemgraph.graph.invalidate import InvalidationReport, write_and_invalidate
-from medmemgraph.graph.writer import WriteReport
+from medmemgraph.graph.writer import WriteReport, write_turns
 from medmemgraph.hydra_client import HydraClient
 from medmemgraph.pipeline.extract import Extractor, extract_facts
 from medmemgraph.pipeline.ids import IdMap, IdMinter
@@ -60,7 +60,16 @@ from medmemgraph.pipeline.loader import Conversation, load_conversation
 from medmemgraph.pipeline.resolve import CanonicalRegistry, Complete, attach_canonical_ids
 from medmemgraph.pipeline.scale_gate import assert_handcheck_passed
 
-__all__ = ["IngestReport", "ingest_patient"]
+__all__ = ["IngestError", "IngestReport", "ingest_patient"]
+
+
+class IngestError(RuntimeError):
+    """One patient's ingest completed the pipeline but produced no graph state.
+
+    Distinct from `ScaleGateError` (gate not green — nothing ran),
+    `LoaderError` (corpus problem), `ExtractionError` (the model failed), and
+    `WriterError` (the engine rejected a statement mid-write). This one means
+    every stage "succeeded" and the graph is still empty."""
 
 
 @dataclass
@@ -73,6 +82,10 @@ class IngestReport:
     facts: list[ClinicalFact]
     write_report: WriteReport
     invalidation_report: InvalidationReport
+    turn_report: WriteReport | None = None
+    """The `:Turn`/`CONTAINS`/`DRAWN_FROM` provenance pass (`writer.write_turns`).
+    Optional so a caller constructing an `IngestReport` by hand (tests) need not
+    supply one."""
 
     @property
     def n_facts_extracted(self) -> int:
@@ -81,6 +94,10 @@ class IngestReport:
     @property
     def n_facts_written(self) -> int:
         return self.write_report.facts_written
+
+    @property
+    def n_turns_written(self) -> int:
+        return self.turn_report.facts_written if self.turn_report else 0
 
 
 def ingest_patient(
@@ -120,6 +137,12 @@ def ingest_patient(
        as the one integration point ARCHITECTURE §6.5 documents as one
        sequence (decisions/005 Finding 2: this is the wiring that was
        missing everywhere in product code before this module existed).
+    6. `graph.writer.write_turns(client, conversation, facts, minter)` — the
+       `:Turn` / `CONTAINS` / `DRAWN_FROM` provenance layer, which only a
+       caller holding the `Conversation` can write (see that function's
+       docstring). Strictly after step 5: `DRAWN_FROM` MATCHes `:Claim`
+       endpoints, and a MATCH against a claim that does not exist yet creates
+       nothing and reports nothing.
 
     `client=None` (the common case) opens a short-lived `HydraClient(
     transport="bolt")` for the duration of this one call and closes it in a
@@ -149,19 +172,46 @@ def ingest_patient(
         id_map=id_map,
     )
 
+    # ONE minter for both write passes. `write_turns` re-derives each `:Claim`
+    # id via `mint_claim_id` to anchor its DRAWN_FROM edges; if it used a
+    # different map, collision linear-probing could hand it a different id, the
+    # edge upsert's `MATCH (s:Claim {id: ...})` would match nothing, and every
+    # DRAWN_FROM edge would silently not be created.
+    minter: IdMinter = id_map if isinstance(id_map, IdMinter) else IdMinter(id_map)
+
     owns_client = client is None
     active_client = client if client is not None else HydraClient(transport="bolt")
     try:
         write_report, invalidation_report = write_and_invalidate(
-            active_client, facts, id_map, now=now, batch_size=batch_size
+            active_client, facts, minter, now=now, batch_size=batch_size
+        )
+        # After write_facts, never before: DRAWN_FROM MATCHes :Claim endpoints.
+        turn_report = write_turns(
+            active_client, conversation, facts, minter, batch_size=batch_size
         )
     finally:
         if owns_client:
             active_client.close()
 
+    # A total skip is a systematic upstream defect, not a bad row, and it is
+    # invisible without this check: `write_and_invalidate` returns normally,
+    # `IngestReport` looks well-formed, and the graph is empty. That is exactly
+    # how the entity-type drift survived until 2026-08-17 — every real fact
+    # failed `schema.label_for`, `writer._register_entity` recorded it on
+    # `WriteReport.skipped` rather than raising, and ingest reported success.
+    # Partial skips stay recorded-not-raised (writer.py's own tested contract).
+    if write_report.total_skip:
+        raise IngestError(
+            f"ingest_patient({subject_id!r}): {write_report.facts_in} fact(s) were extracted "
+            f"and resolved but NONE were written to the graph — every one was skipped. "
+            f"This is a systematic contract violation upstream of the writer, not a data "
+            f"problem. Reasons: {write_report.skip_summary()}"
+        )
+
     return IngestReport(
         subject_id=subject_id,
         facts=facts,
+        turn_report=turn_report,
         write_report=write_report,
         invalidation_report=invalidation_report,
     )

@@ -31,7 +31,12 @@ import pytest
 
 from medmemgraph import llm
 from medmemgraph.contracts import PREDICATES, SENTINEL_VALID_TO
-from medmemgraph.pipeline.extract import ExtractionError, Extractor, extract_facts
+from medmemgraph.pipeline.extract import (
+    _KNOWN_DECISIONS,
+    ExtractionError,
+    Extractor,
+    extract_facts,
+)
 from medmemgraph.pipeline.loader import Admission, Conversation
 
 PATIENT_ID = "patient-0042"
@@ -957,10 +962,19 @@ class TestDecisionCountsSurfacesDroppedNoPredicate:
         conversation = _build_prn_conversation()
         extractor.extract(conversation)
         counts = extractor.decision_counts()
-        assert set(counts) == {"emitted", "dropped_by_rule", "dropped_no_predicate", "dropped_invalid"}
+        # Keyed off `_KNOWN_DECISIONS` rather than a hardcoded literal set, so
+        # adding a decision kind cannot silently make this assertion stale
+        # (it did: `dropped_role_reversal_unrepairable` and the non-exclusive
+        # `repaired_role_reversal` counter both landed after this test was
+        # written, and it had been failing on the exact-set compare since).
+        assert set(counts) == set(_KNOWN_DECISIONS) | {"repaired_role_reversal"}
         assert counts["dropped_no_predicate"] == 0  # bug 2 is fixed: nothing drops for this reason here
         assert counts["dropped_by_rule"] == 3  # conditional + hypothetical + not-associated-with-patient
         assert counts["emitted"] == 6  # 5 medication facts + 1 HAD_INCIDENT fact
+        # `repaired_role_reversal` double-counts against its own `decision`, so
+        # the partition invariant below only holds while no repair fired — assert
+        # that precondition rather than letting the sum silently encode it.
+        assert counts["repaired_role_reversal"] == 0
         assert sum(counts.values()) == len(extractor.assertion_log)
 
     def test_decision_counts_reports_a_real_dropped_no_predicate_when_it_happens(self):
@@ -980,3 +994,129 @@ class TestDecisionCountsSurfacesDroppedNoPredicate:
         conversation = _build_conversation()
         extractor.extract(conversation)
         assert extractor.decision_counts()["dropped_no_predicate"] == 1
+
+
+class TestEntityTypeNormalizationReachesTheWriter:
+    """The 2026-08-17 silent-skip bug.
+
+    Real LLM runs emitted lowercase `object_type` (`symptom`, `medication`,
+    `dosage`). `graph/schema.label_for` accepts only the exact-cased labels, and
+    `graph/writer._register_entity` *catches* that `ValueError` and records the
+    fact on `WriteReport.skipped` instead of raising. So every fact from every
+    real extraction run was dropped, and ingest reported success with
+    `facts_written == 0`.
+
+    These tests assert the contract that closes it: whatever `_handle_candidate`
+    puts on `EntityRef.type` is always something `schema.label_for` accepts.
+    """
+
+    @staticmethod
+    def _extract_one(object_type: str, *, predicate_phrase="is taking", object_name="metformin"):
+        payload = {
+            "facts": [
+                _candidate(
+                    predicate_phrase=predicate_phrase,
+                    object_name=object_name,
+                    object_type=object_type,
+                    assertion="present",
+                    turn_ids=[1],
+                )
+            ]
+        }
+        extractor = Extractor(complete_fn=FakeComplete([payload]))
+        facts = extractor.extract(_build_conversation())
+        return extractor, facts
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("medication", "Medication"),
+            ("MEDICATION", "Medication"),
+            ("  Medication  ", "Medication"),
+            ("drug", "Medication"),
+            ("med", "Medication"),
+        ],
+    )
+    def test_lowercase_and_alias_object_types_canonicalize(self, raw, expected):
+        _, facts = self._extract_one(raw)
+        assert len(facts) == 1
+        assert facts[0].object.type == expected
+
+    def test_every_emitted_object_type_is_accepted_by_label_for(self):
+        """The load-bearing invariant. `label_for` stays strict on purpose;
+        normalization happens upstream at emit time so that `ids.mint_entity_id`
+        (which hashes the type into the node id) and `resolve.block` (which
+        partitions on it) both see one canonical spelling."""
+        from medmemgraph.graph.schema import label_for
+
+        for raw in ("symptom", "condition", "procedure", "dosage", "medication", "provider"):
+            _, facts = self._extract_one(raw, predicate_phrase="is taking", object_name="thing")
+            for fact in facts:
+                label_for(fact.object.type)  # must not raise
+                label_for(fact.subject.type)
+
+    def test_unmappable_type_drops_visibly_instead_of_reaching_the_writer(self):
+        """A type outside the vocabulary must drop HERE, with a named decision —
+        not survive as the old `"Entity"` placeholder and get silently skipped
+        by the writer several modules later."""
+        extractor, facts = self._extract_one("Spaceship", object_name="millennium falcon")
+        assert facts == []
+        assert extractor.decision_counts()["dropped_unmappable_entity_type"] == 1
+        assert any(e.decision == "dropped_unmappable_entity_type" for e in extractor.assertion_log)
+
+    def test_object_type_enum_is_pinned_to_the_closed_vocabulary(self):
+        """The schema sent to the model constrains `object_type`, so canonical
+        labels come back by construction and the alias table is only a fallback."""
+        from medmemgraph.contracts import DOMAIN_ENTITY_TYPES
+        from medmemgraph.pipeline.extract import _CANDIDATE_FACT_SCHEMA  # noqa: PLC0415
+
+        prop = _CANDIDATE_FACT_SCHEMA["properties"]["object_type"]
+        assert set(prop["enum"]) == set(DOMAIN_ENTITY_TYPES)
+
+
+class TestUnusableEntityNamesDropTheFactNotThePatient:
+    """Regression: subject 10312715 aborted a real 3-patient ingest with
+    `ValueError: canonical_name normalizes to empty string: ''`.
+
+    `ids.normalize_key` strips punctuation to build the identity key, so a name
+    that is a non-empty STRING but all symbols ("---", "?") normalizes to "" and
+    `mint_entity_id` correctly refuses it — an entity with no name has no
+    identity. But that ValueError surfaced from inside entity resolution, after
+    ~7 minutes of already-paid extraction, and took the whole patient with it.
+    One unusable candidate must cost one fact, not one patient."""
+
+    @staticmethod
+    def _extract(object_name: str):
+        payload = {
+            "facts": [
+                _candidate(
+                    predicate_phrase="is taking",
+                    object_name=object_name,
+                    object_type="Medication",
+                    assertion="present",
+                    turn_ids=[1],
+                )
+            ]
+        }
+        extractor = Extractor(complete_fn=FakeComplete([payload]))
+        return extractor, extractor.extract(_build_conversation())
+
+    @pytest.mark.parametrize("name", ["---", "?", "  ", "...", "!!!"])
+    def test_symbol_only_names_are_dropped_with_a_named_decision(self, name):
+        extractor, facts = self._extract(name)
+        assert facts == []
+        assert extractor.decision_counts()["dropped_unusable_entity_name"] == 1
+
+    def test_a_real_name_still_survives(self):
+        _, facts = self._extract("metformin")
+        assert len(facts) == 1
+
+    def test_every_emitted_fact_can_actually_be_minted(self):
+        """The invariant the crash violated: anything this module emits must be
+        mintable. Asserted directly rather than trusted."""
+        from medmemgraph.pipeline.ids import mint_entity_id
+
+        for name in ("metformin", "---", "60 mg", "?", "chest pain"):
+            _, facts = self._extract(name)
+            for fact in facts:
+                mint_entity_id("p", fact.object.type, fact.object.name)  # must not raise

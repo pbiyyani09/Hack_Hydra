@@ -66,6 +66,7 @@ list for the pattern this follows):
 from __future__ import annotations
 
 import argparse
+import inspect
 from typing import Callable
 
 from medmemgraph.contracts import RetrieveResult
@@ -112,11 +113,29 @@ def _con_dict(answer: Answer) -> dict:
     }
 
 
+
+def _accepts_epsilon(retriever) -> bool:
+    """Does this retriever take an `epsilon=` keyword?
+
+    Introspected rather than isinstance-checked so any caller-supplied
+    retriever participates without knowing about the flag. Unintrospectable
+    callables answer False — degrading to the plain 3-arg call, never a
+    TypeError mid-demo."""
+    try:
+        params = inspect.signature(retriever).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return "epsilon" in params
+
+
 def chat_once(
     question: str,
     patient_id: str,
     *,
     k: int = DEFAULT_K,
+    epsilon: float | None = 0.0,
     retriever: Retriever | None = None,
     dry_run: bool = False,
 ) -> dict:
@@ -143,7 +162,22 @@ def chat_once(
     recorded demo (`VIDEO_SCRIPT.md`) must run with real inference.
     """
     retriever = retriever or graph_retrieve
-    pack: RetrieveResult = retriever(question, patient_id, k)
+    # epsilon=0 by default HERE, unlike `retrieve()`'s live default of 0.05.
+    # That 5% exploration exists to log a non-zero propensity for the unchosen
+    # arm so offline policy evaluation stays possible later — worth it for a
+    # deployed system collecting data, actively harmful for a demo, where it
+    # means roughly one in twenty questions silently takes the wrong route and
+    # a recorded take is ruined for no visible reason. Pass --epsilon 0.05 to
+    # restore exploration.
+    # Forward `epsilon` only to a retriever that accepts it. The real
+    # `graph.retrieve.retrieve` does; the simple 3-arg callables injected by
+    # tests and by `contracts.mock_retrieve` do not, and passing it blindly
+    # turns every injected retriever into a TypeError.
+    pack: RetrieveResult = (
+        retriever(question, patient_id, k, epsilon=epsilon)
+        if epsilon is not None and _accepts_epsilon(retriever)
+        else retriever(question, patient_id, k)
+    )
 
     con_answer = answer_con(
         question,
@@ -188,6 +222,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_K,
         help=f"top-k evidence items retrieved per question (default: {DEFAULT_K})",
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.0,
+        help=(
+            "router exploration rate (default: 0.0, deterministic). retrieve()'s "
+            "own live default is 0.05, which flips roughly 1 question in 20 to "
+            "the other arm to keep offline policy evaluation possible; that is "
+            "the wrong trade for a demo or a recording. Pass 0.05 to restore it."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -269,6 +314,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     print(f"MedMemGraph chat -- patient {args.patient!r}. Ctrl-D or 'exit' to quit.")
+    if args.epsilon:
+        print(f"(--epsilon {args.epsilon}: routing is randomized, not deterministic)")
     if args.dry_run:
         print("(--dry-run: offline stub answers, no API key, no LLM cost)")
 
@@ -285,7 +332,13 @@ def main(argv: list[str] | None = None) -> int:
             break
 
         try:
-            result = chat_once(question, args.patient, k=args.k, dry_run=args.dry_run)
+            result = chat_once(
+                question,
+                args.patient,
+                k=args.k,
+                epsilon=args.epsilon,
+                dry_run=args.dry_run,
+            )
         except Exception as exc:  # noqa: BLE001 - a bad turn must not kill the demo loop
             print(f"error: {exc}")
             continue

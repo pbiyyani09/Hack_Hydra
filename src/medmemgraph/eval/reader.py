@@ -109,6 +109,7 @@ and diff the resulting per-category tables, the same A/B pattern
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import random
@@ -133,6 +134,7 @@ __all__ = [
     "ReaderAnswerer",
     "ReaderDirectAnswerer",
     "ReaderChainOfNoteAnswerer",
+    "MedMemGraphAnswerer",
 ]
 
 DEFAULT_READER_MODEL = llm.ANSWER_MODEL
@@ -662,6 +664,24 @@ def read(
 # ---------------------------------------------------------------------------
 
 
+def _accepts_gold_labels(retriever: Callable) -> bool:
+    """Can this retriever take the benchmark's `scope`/`question_type` labels?
+
+    `retrieve`/`retrieve_for_eval` can (keyword-only params / `**kwargs`);
+    `contracts.mock_retrieve` cannot. Introspected rather than type-checked so a
+    caller-injected retriever (tests, `dense.py`/`lexical.py`'s timing wrapper)
+    participates without needing to know about this at all. Unintrospectable
+    callables answer False — degrading to the old positional call, never a
+    TypeError mid-run."""
+    try:
+        params = inspect.signature(retriever).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return "scope" in params and "question_type" in params
+
+
 def _default_retriever() -> Callable[[str, str, int], RetrieveResult]:
     """Prefer the real graph-backed retriever once Graph lands it (opt in
     via `$MEDMEMGRAPH_USE_REAL_RETRIEVE=1`); fall back to
@@ -733,12 +753,53 @@ class ReaderAnswerer:
         # only two call sites that pass this kwarg always pass `None`.
         self.client = client
         self.retriever = retriever or _default_retriever()
+        self._retriever_takes_labels = _accepts_gold_labels(self.retriever)
+
+    def _retrieve(
+        self,
+        question: str,
+        patient_id: str,
+        *,
+        scope: str | None,
+        question_type: str | None,
+    ) -> RetrieveResult:
+        """Call the retriever, forwarding the benchmark's gold `scope` /
+        `question_type` when it can accept them.
+
+        This is load-bearing, not cosmetic. `graph/router.py` has two entry
+        points: `route_eval`, which applies the FROZEN gold-label rule that is
+        the actual thing under evaluation, and `route_live`, a keyword-regex
+        heuristic that stands in when no labels exist (demo time). `retrieve()`
+        picks `route_eval` only if `scope` or `question_type` is non-None.
+
+        Until 2026-08-17 this method called `self.retriever(question, patient_id,
+        self.k)` positionally, so every eval item hit `route_live` — meaning the
+        reported numbers measured a keyword heuristic, not the routing rule the
+        project's whole graph-vs-vector argument rests on, and
+        `retrieve_for_eval`'s epsilon=0 pinning was guarding a decision that was
+        never made from gold labels in the first place. Concretely, an
+        `adversarial` item only reached the graph arm (the abstention signal) if
+        its wording happened to match `_GRAPH_KEYWORD_RE`.
+
+        `mock_retrieve` takes exactly `(question, patient_id, k)`, so the forward
+        is conditional rather than unconditional."""
+        if self._retriever_takes_labels:
+            return self.retriever(
+                question, patient_id, self.k, scope=scope, question_type=question_type
+            )
+        return self.retriever(question, patient_id, self.k)
 
     def answer(
-        self, question: str, conversation: Conversation | None, *, patient_id: str
+        self,
+        question: str,
+        conversation: Conversation | None,
+        *,
+        patient_id: str,
+        scope: str | None = None,
+        question_type: str | None = None,
     ) -> AnswerResult:
         del conversation  # this system answers over *retrieved* evidence, not raw turn history
-        pack = self.retriever(question, patient_id, self.k)
+        pack = self._retrieve(question, patient_id, scope=scope, question_type=question_type)
         result = read(
             question,
             pack.items,
@@ -766,3 +827,39 @@ class ReaderDirectAnswerer(ReaderAnswerer):
 class ReaderChainOfNoteAnswerer(ReaderAnswerer):
     mode = "chain_of_note"
     name = "reader_con"
+
+
+class MedMemGraphAnswerer(ReaderChainOfNoteAnswerer):
+    """The headline system: the real graph/vector router + Chain-of-Note.
+
+    Registered as its own system rather than relying on
+    `$MEDMEMGRAPH_USE_REAL_RETRIEVE=1` flipping `reader_con`'s meaning, for two
+    reasons:
+
+    1. **It makes the results table honest.** `reader_con` is the Chain-of-Note
+       READING ablation, scored on `mock_retrieve` evidence so that reading
+       strategy is the only variable against `reader_direct`. This system varies
+       retrieval instead. Collapsing both onto one row name, switched by an
+       environment variable, would make a results file's meaning depend on the
+       shell that produced it.
+
+    2. **The env-var path fails silently in the worst direction.** If it is
+       unset (or set to anything but the exact string `"1"`), the reader falls
+       back to `contracts.mock_retrieve`; if that returns nothing, `read()`
+       short-circuits to `NOT_IN_RECORD` at zero tokens and zero cost. The run
+       completes, writes a full results file, spends nothing, and scores near
+       zero on every answerable item — a real-looking table built on no
+       retrieval at all.
+
+    `retrieve_for_eval`, not `retrieve`: it pins `epsilon=0` and raises if a
+    caller tries to override, so reported tables run the frozen deterministic
+    routing rule rather than carrying ~5% exploration-flipped routes."""
+
+    name = "medmemgraph"
+
+    def __init__(self, **kwargs) -> None:
+        if kwargs.get("retriever") is None:
+            from medmemgraph.graph.retrieve import retrieve_for_eval
+
+            kwargs["retriever"] = retrieve_for_eval
+        super().__init__(**kwargs)

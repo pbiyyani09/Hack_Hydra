@@ -85,13 +85,16 @@ from typing import Callable
 
 from medmemgraph import llm
 from medmemgraph.contracts import (
+    DOMAIN_ENTITY_TYPES,
     PREDICATES,
     SENTINEL_VALID_TO,
     ClinicalFact,
     EntityRef,
     is_patient_ish_token,
+    normalize_entity_type,
     validate,
 )
+from medmemgraph.pipeline.ids import normalize_key
 from medmemgraph.pipeline.loader import Admission, Conversation, Turn
 from medmemgraph.pipeline.normalize import PREDICATE_DEFINITIONS, canonicalize_predicate, resolve_time
 
@@ -129,6 +132,8 @@ _KNOWN_DECISIONS = (
     "dropped_no_predicate",
     "dropped_invalid",
     "dropped_role_reversal_unrepairable",
+    "dropped_unmappable_entity_type",
+    "dropped_unusable_entity_name",
 )
 """Every `AssertionLogEntry.decision` value this module ever writes —
 `Extractor.decision_counts()`'s zero-fill keys, kept as one source of truth
@@ -256,7 +261,22 @@ _CANDIDATE_FACT_SCHEMA = {
                 "example in the system prompt."
             ),
         },
-        "object_type": {"type": "string"},
+        "object_type": {
+            # Pinned to the closed vocabulary (2026-08-17). Previously a free
+            # `{"type": "string"}`, which is why real runs emitted lowercase
+            # `symptom`/`medication`/`dosage` and every fact was later skipped
+            # by the graph writer. `_handle_candidate` still normalizes what
+            # comes back — this enum stops the drift at the source, the alias
+            # table in `contracts.py` catches whatever slips past it.
+            "type": "string",
+            "enum": sorted(DOMAIN_ENTITY_TYPES),
+            "description": (
+                "The kind of clinical entity named in object_name. "
+                "'Dosage' is for a dose amount ('60mg') and pairs with the "
+                "CURRENT_DOSAGE_OF predicate; the medication itself goes in "
+                "subject_name for that predicate."
+            ),
+        },
         "assertion": {"type": "string", "enum": list(_I2B2_TAGS)},
         "prn": {
             "type": "boolean",
@@ -1039,7 +1059,51 @@ class Extractor:
         else:
             subject = EntityRef(name=patient_id, type="Patient", canonical_id=0)
 
-        object_ref = EntityRef(name=object_name, type=object_type or "Entity", canonical_id=0)
+        # Canonicalize the model's free-text `object_type` onto the closed
+        # `DOMAIN_ENTITY_TYPES` vocabulary HERE, at emit time — not later in
+        # `graph/schema.label_for`. Three downstream consumers read this string
+        # raw and never call `label_for`: `ids.mint_entity_id` hashes it into
+        # the node id, `resolve.block` partitions on it, and `writer` stores it
+        # as the node's `type` property. Normalizing at the label layer instead
+        # would leave `medication` and `Medication` minting two ids in two
+        # blocking partitions — duplicate nodes the label check cannot detect.
+        #
+        # Before this fix `type` fell back to the literal `"Entity"`, which is
+        # not a graph label, so `writer._register_entity` skipped the fact onto
+        # `WriteReport.skipped` — recorded, never raised. Real runs emitted
+        # lowercase types for every fact, so 100% were dropped and ingest
+        # reported success with `facts_written == 0`.
+        canonical_object_type = normalize_entity_type(object_type)
+        if canonical_object_type is None:
+            log(
+                "dropped_unmappable_entity_type",
+                f"object_type {object_type!r} does not map onto any DOMAIN_ENTITY_TYPES "
+                f"member (object_name={object_name!r}) — dropping rather than emitting a "
+                "fact the graph writer would silently skip",
+            )
+            return None
+
+        # An entity name that survives as a non-empty STRING but normalizes to
+        # nothing (all punctuation/symbols, e.g. "---" or "?") has no identity:
+        # `ids.normalize_key` is what builds the `<normalized_name>` fragment of
+        # the identity key, so `mint_entity_id` correctly refuses it with a
+        # ValueError. That assertion is right and stays strict — but raising
+        # from inside entity resolution aborts the ENTIRE patient, which is what
+        # killed subject 10312715 on the first real 3-patient run after ~7
+        # minutes of paid extraction had already succeeded. Catch it here, where
+        # one bad candidate costs one dropped fact instead of one lost patient.
+        if not normalize_key(object_name) or (
+            subject.type != "Patient" and not normalize_key(subject.name)
+        ):
+            log(
+                "dropped_unusable_entity_name",
+                f"entity name normalizes to empty (subject={subject.name!r}, "
+                f"object={object_name!r}) — no stable identity key can be derived, "
+                "so this fact cannot be minted or merged",
+            )
+            return None
+
+        object_ref = EntityRef(name=object_name, type=canonical_object_type, canonical_id=0)
 
         fact_id = _placeholder_fact_id(
             patient_id=patient_id,

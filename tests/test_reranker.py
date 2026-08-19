@@ -39,11 +39,16 @@ import pytest
 
 from medmemgraph.contracts import RetrieveItem
 from medmemgraph.graph.reranker import (
+    ENV_DEFAULT_MAX_LENGTH,
     REGISTERED_MODELS,
+    RERANKER_ENV_VAR,
     CrossEncoderReranker,
     NoopReranker,
     RerankerBackend,
+    RerankerModelSpec,
     TwoStageResult,
+    reranker_from_env,
+    spec_from_env,
     two_stage_retrieve,
 )
 
@@ -511,3 +516,104 @@ class TestCpuAblationModelsReal:
     # requirement; each arm's own honest capability is exactly what a
     # held-out-data ablation run (§1 caveat, module docstring) should
     # measure across many queries, not this one illustrative case.
+
+
+class TestEnvDrivenSelection:
+    """`spec_from_env` / `reranker_from_env` — the handoff surface for a
+    fine-tuned checkpoint. The contract is: hand over a directory, set one
+    environment variable, change no code and edit no registry."""
+
+    def test_unset_env_means_reranking_is_off(self):
+        assert spec_from_env({}) is None
+        assert reranker_from_env({}) is None
+
+    @pytest.mark.parametrize("value", ["", "0", "off", "false", "none", "noop", "OFF"])
+    def test_explicit_off_values(self, value):
+        assert spec_from_env({RERANKER_ENV_VAR: value}) is None
+
+    def test_a_registered_key_resolves_to_that_exact_spec(self):
+        spec = spec_from_env({RERANKER_ENV_VAR: "qwen3-rerank-0.6b"})
+        assert spec is REGISTERED_MODELS["qwen3-rerank-0.6b"]
+
+    def test_a_local_directory_becomes_an_ad_hoc_spec(self):
+        spec = spec_from_env(
+            {
+                RERANKER_ENV_VAR: "/models/teammate-ft-reranker",
+                "MEDMEMGRAPH_RERANKER_KIND": "seq_classification",
+            }
+        )
+        assert spec is not None
+        # hf_id is handed straight to from_pretrained/CrossEncoder, both of which
+        # accept a local path — that is what makes the no-code-change handoff work.
+        assert spec.hf_id == "/models/teammate-ft-reranker"
+        assert spec.kind == "seq_classification"
+        assert spec.backend == "torch"
+
+    def test_registry_is_never_mutated_by_env_selection(self):
+        """`tests/test_reranker.py` asserts REGISTERED_MODELS' exact contents
+        elsewhere; the env path must construct a spec, never register one."""
+        before = dict(REGISTERED_MODELS)
+        spec_from_env({RERANKER_ENV_VAR: "/models/whatever"})
+        assert REGISTERED_MODELS == before
+        assert "/models/whatever" not in REGISTERED_MODELS
+        assert "env" not in REGISTERED_MODELS
+
+    def test_unregistered_key_still_raises_without_spec(self):
+        with pytest.raises(ValueError, match="unregistered reranker model_key"):
+            CrossEncoderReranker("not-a-real-key")
+
+    def test_spec_bypasses_the_registry_check(self):
+        spec = RerankerModelSpec(key="env", hf_id="/tmp/ckpt", kind="seq_classification")
+        r = CrossEncoderReranker(spec=spec)  # must not raise; loading stays lazy
+        assert r.name == "env"
+        assert r.spec.hf_id == "/tmp/ckpt"
+
+    def test_onnx_plus_causal_yesno_is_rejected_rather_than_mis_dispatched(self):
+        """`_ensure_loaded` routes backend=='onnx' through the
+        sequence-classification path only, so this combination would load down
+        the wrong branch. Fail at config time, not at first query."""
+        with pytest.raises(ValueError, match="not supported yet"):
+            spec_from_env(
+                {
+                    RERANKER_ENV_VAR: "/models/x",
+                    "MEDMEMGRAPH_RERANKER_KIND": "causal_yesno",
+                    "MEDMEMGRAPH_RERANKER_BACKEND": "onnx",
+                }
+            )
+
+    def test_cpu_defaults_are_the_deployment_target_not_the_class_defaults(self):
+        """The class default max_length is 4096, sized for GPU long-document
+        reranking. The env path defaults to 512 because the docs here are single
+        turns and the target box has no GPU."""
+        r = reranker_from_env({RERANKER_ENV_VAR: "/models/x"})
+        assert r.max_length == ENV_DEFAULT_MAX_LENGTH == 512
+        assert r._device == "cpu"
+        assert r._fp16_requested is False
+
+
+class TestEnvDefaultsToRealEnviron:
+    """`spec_from_env()` / `reranker_from_env()` with NO argument.
+
+    Every other test in `TestEnvDrivenSelection` passes an explicit env dict,
+    which is exactly why a missing `import os` survived them: the
+    `env = os.environ if env is None else env` line was never executed. The
+    no-argument call is the ONLY form the teammate handoff uses
+    (`export MEDMEMGRAPH_RERANKER=...` then call it), so it gets its own test."""
+
+    def test_no_argument_call_reads_the_process_environment(self, monkeypatch):
+        monkeypatch.delenv(RERANKER_ENV_VAR, raising=False)
+        assert spec_from_env() is None
+        assert reranker_from_env() is None
+
+        monkeypatch.setenv(RERANKER_ENV_VAR, "qwen3-rerank-0.6b")
+        spec = spec_from_env()
+        assert spec is not None and spec.key == "qwen3-rerank-0.6b"
+
+    def test_no_argument_call_picks_up_a_local_checkpoint(self, monkeypatch):
+        monkeypatch.setenv(RERANKER_ENV_VAR, "/models/teammate-ft")
+        monkeypatch.setenv("MEDMEMGRAPH_RERANKER_KIND", "seq_classification")
+        spec = spec_from_env()
+        assert spec is not None and spec.hf_id == "/models/teammate-ft"
+        # Construction must also work with no env argument (lazy load, so no
+        # weights are touched here).
+        assert reranker_from_env() is not None

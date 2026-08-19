@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 
+from medmemgraph.contracts import DOMAIN_ENTITY_TYPES as CONTRACTS_DOMAIN_ENTITY_TYPES
 from medmemgraph.contracts import SENTINEL_VALID_TO as CONTRACTS_SENTINEL
 from medmemgraph.graph import schema
 from medmemgraph.hydra_client import validate_dialect
@@ -25,6 +26,12 @@ def test_current_as_of_cypher_passes_dialect_gate_and_names_the_right_labels() -
 
 
 def test_labels_match_frozen_set_exactly() -> None:
+    # `Dosage` added 2026-08-17 with the entity-type normalization fix. A dose
+    # is its own node, not a `:Medication`: `CURRENT_DOSAGE_OF` is one of only
+    # three FUNCTIONAL_KEYS (the predicates that fire SUPERSEDES), so the
+    # "furosemide 40mg -> 60mg" chain is the canonical invalidation-by-closing
+    # walk. Folding doses into `:Medication` would let `resolve._similar` merge
+    # "40mg" and "60mg" — trigram-similar — and erase that chain.
     assert schema.LABELS == frozenset(
         {
             "Patient",
@@ -37,10 +44,24 @@ def test_labels_match_frozen_set_exactly() -> None:
             "Symptom",
             "Procedure",
             "Provider",
+            "Dosage",
         }
     )
     for banned in ("Episode", "HAS_CLAIM", "SAME_AS"):
         assert banned not in schema.LABELS
+
+
+def test_domain_entity_labels_do_not_drift_from_the_wire_vocabulary() -> None:
+    """`schema.DOMAIN_ENTITY_LABELS` is derived from
+    `contracts.DOMAIN_ENTITY_TYPES`, not restated. Drift between the two is what
+    made `writer.write_facts` silently skip 100% of real facts before the
+    2026-08-17 fix — extraction emitted lowercase types, `label_for` accepted
+    only the exact-cased labels, and the mismatch was recorded on
+    `WriteReport.skipped` rather than raised."""
+    assert schema.DOMAIN_ENTITY_LABELS == CONTRACTS_DOMAIN_ENTITY_TYPES
+    assert schema.DOMAIN_ENTITY_LABELS <= schema.LABELS
+    # The structural/provenance labels are never ABOUT targets.
+    assert schema.DOMAIN_ENTITY_LABELS.isdisjoint({"Patient", "Admission", "Turn", "Claim"})
 
 
 def test_rel_types_match_frozen_set_exactly() -> None:

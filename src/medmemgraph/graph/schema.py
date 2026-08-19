@@ -21,7 +21,7 @@ Do NOT add `SAME_AS`, `HAS_CLAIM`, `HAS_EPISODE`, `FROM_EPISODE`,
 
 from __future__ import annotations
 
-from medmemgraph.contracts import SENTINEL_VALID_TO
+from medmemgraph.contracts import DOMAIN_ENTITY_TYPES, SENTINEL_VALID_TO
 
 __all__ = [
     "SENTINEL_VALID_TO",
@@ -39,21 +39,6 @@ __all__ = [
 # Labels — ARCHITECTURE.md §5.1
 # ---------------------------------------------------------------------------
 
-LABELS = frozenset(
-    {
-        "Patient",
-        "Admission",
-        "Turn",
-        "Claim",
-        "Condition",
-        "Medication",
-        "Allergy",
-        "Symptom",
-        "Procedure",
-        "Provider",
-    }
-)
-
 # Domain-entity labels — the subset of LABELS that ABOUT edges may target
 # (i.e. LABELS minus the structural/provenance labels Patient/Admission/
 # Turn/Claim). `EntityRef.type` on a ClinicalFact is expected to name one of
@@ -61,8 +46,27 @@ LABELS = frozenset(
 # "the claim's object, and, when the subject is not the patient, the
 # subject" — so a subject EntityRef of type "Patient" never gets an ABOUT
 # edge of its own; see graph/writer.py).
-DOMAIN_ENTITY_LABELS = frozenset(
-    {"Condition", "Medication", "Allergy", "Symptom", "Procedure", "Provider"}
+#
+# DERIVED from `contracts.DOMAIN_ENTITY_TYPES` rather than restated, so the
+# wire vocabulary Pipeline emits and the label vocabulary Graph accepts cannot
+# drift apart — the drift between them is precisely what made `write_facts`
+# silently skip 100% of real facts before 2026-08-17.
+DOMAIN_ENTITY_LABELS = frozenset(DOMAIN_ENTITY_TYPES)
+
+# `Dosage` (2026-08-17): a dose is a first-class entity node, not a property.
+# `CURRENT_DOSAGE_OF` is one of only three FUNCTIONAL_KEYS below — the
+# predicates that fire SUPERSEDES — so "furosemide 40mg -> 60mg" is the
+# canonical invalidation-by-closing chain this project's graph argument rests
+# on. Modelling the dose as a `:Medication` would merge "40mg" and "60mg" into
+# one canonical node under `resolve._similar` and erase that chain.
+LABELS = frozenset(
+    {
+        "Patient",
+        "Admission",
+        "Turn",
+        "Claim",
+    }
+    | DOMAIN_ENTITY_LABELS
 )
 
 # ---------------------------------------------------------------------------

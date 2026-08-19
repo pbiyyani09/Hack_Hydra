@@ -155,11 +155,26 @@ def _check_in(stripped: str, original: str) -> str | None:
 
 
 def _check_contains(stripped: str, original: str) -> str | None:
-    if re.search(r"\bCONTAINS\b", stripped, re.IGNORECASE):
+    # `CONTAINS` is BOTH a rejected string operator and a legal relationship type
+    # in this project's own frozen schema (`schema.REL_TYPES` — the
+    # `(:Admission)-[:CONTAINS]->(:Turn)` edge, ARCHITECTURE §5.2). A bare
+    # `\bCONTAINS\b` match rejected both, which made that edge impossible to
+    # write through the only client this project has: the schema declared a
+    # relationship the transport refused to carry. Found 2026-08-17 when the
+    # `:Turn` provenance layer first tried to write it.
+    #
+    # A relationship type (and a label) is always introduced by a colon; the
+    # string operator never is. That is the whole distinction, so a
+    # colon-lookbehind is sufficient and stays narrow. `:\s+` is normalized
+    # first so `[r: CONTAINS]` is treated the same as `[r:CONTAINS]`.
+    operator_position = re.sub(r":\s+", ":", stripped)
+    if re.search(r"(?<!:)\bCONTAINS\b", operator_position, re.IGNORECASE):
         return (
             "`CONTAINS` is rejected (only `STARTS WITH` is a legal string "
             "predicate — literature/10 §A3). Fix: use `STARTS WITH` for a "
-            "prefix match, or filter client-side after a broader labelled MATCH."
+            "prefix match, or filter client-side after a broader labelled MATCH. "
+            "(The `:CONTAINS` relationship type is unaffected — this check only "
+            "fires on the infix string operator.)"
         )
     if re.search(r"\bENDS\s+WITH\b", stripped, re.IGNORECASE):
         return (

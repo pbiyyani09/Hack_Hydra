@@ -260,6 +260,16 @@ data/
 # stub-derived (dry_run / token-overlap fallback judge). Shipping it would read
 # as evidence. At freeze, `git add -f` ONLY the curated report — deliberately.
 results/
+# Same rule, same reasons, for the A/B and local-answerer output directories
+# added 2026-08-18 (`results-rerank/`, `results-local/`, and any future
+# `results-*`). Two independent reasons, either sufficient:
+#   1. Shipping raw eval output reads as evidence when it is intermediate data.
+#   2. `judge_reason` strings paraphrase the clinical content of the answers
+#      ("...identified C. difficile instead of ulcerative colitis"), which is
+#      MIMIC-IV-Note-derived text under a PhysioNet DUA that restricts
+#      redistribution — the same reason decisions/001 never vendors the corpus.
+# At freeze, `git add -f` ONLY the curated report — deliberately.
+results-*/
 # Original brainstorm note; its plan (Synthea corpus) was superseded by MedLoCoMo.
 message (1).txt
 # --- end submission hygiene ---

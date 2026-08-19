@@ -20,10 +20,11 @@ from __future__ import annotations
 import os
 import time
 
+from medmemgraph import llm
 from medmemgraph.eval.types import AnswerResult, estimate_tokens
 from medmemgraph.pipeline.loader import Conversation
 
-DEFAULT_MODEL = os.environ.get("MEDMEMGRAPH_ANSWERER_MODEL", "claude-haiku-4-5")
+DEFAULT_MODEL = os.environ.get("MEDMEMGRAPH_ANSWERER_MODEL", llm.ANSWER_MODEL)
 """Default answerer model. claude-haiku-4-5 is the fast/cheap current model
 (claude-api skill, `shared/models.md`) — chosen so the baseline ladder is
 affordable to run across a whole patient's QA set; override via
@@ -62,35 +63,44 @@ class NoMemoryAnswerer:
         self.model = model
         self.dry_run = dry_run
         self.max_tokens = max_tokens
+        # `client` is accepted for signature parity with the other baselines and
+        # is inert: real calls go through `llm.complete()`, the one seam every
+        # LLM-dependent module in this project shares. This class previously did
+        # `import anthropic` here — a package removed from `pyproject.toml` when
+        # that seam replaced it, so constructing this baseline for a real run
+        # raised `ModuleNotFoundError`. Rung 1 of the baseline ladder could not
+        # run at all (2026-08-17).
         self._client = client
-        if not dry_run and self._client is None:
-            import anthropic
-
-            self._client = anthropic.Anthropic()
 
     def answer(
-        self, question: str, conversation: Conversation | None, *, patient_id: str
+        self,
+        question: str,
+        conversation: Conversation | None,
+        *,
+        patient_id: str,
+        scope: str | None = None,
+        question_type: str | None = None,
     ) -> AnswerResult:
         del conversation, patient_id  # contract: no-memory never reads history
+        # Accepted for Answerer-protocol parity; this system does no
+        # retrieval, so there is no router for the gold labels to reach.
+        del scope, question_type
 
         if self.dry_run:
             return self._stub_answer(question)
 
-        start = time.monotonic()
-        response = self._client.messages.create(
+        response = llm.complete(
+            question,
             model=self.model,
-            max_tokens=self.max_tokens,
             system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": question}],
+            max_tokens=self.max_tokens,
+            temperature=0.0,
         )
-        latency_ms = (time.monotonic() - start) * 1000.0
-        text = next((b.text for b in response.content if b.type == "text"), "")
-        usage = response.usage
         return AnswerResult(
-            text=text,
-            prompt_tokens=usage.input_tokens,
-            completion_tokens=usage.output_tokens,
-            latency_ms=latency_ms,
+            text=response.text,
+            prompt_tokens=response.prompt_tokens,
+            completion_tokens=response.completion_tokens,
+            latency_ms=response.latency_ms,
         )
 
     def _stub_answer(self, question: str) -> AnswerResult:

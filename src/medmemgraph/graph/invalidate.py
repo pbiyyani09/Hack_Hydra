@@ -183,6 +183,29 @@ def is_functional(predicate: str) -> bool:
 # ---------------------------------------------------------------------------
 POSSIBLE_CONFIDENCE_FLOOR = 0.5
 
+# ---------------------------------------------------------------------------
+# MEASURED INTERACTION (2026-08-18, 20-patient corpus run) — read before
+# tuning either constant.
+#
+# `POSSIBLE_CONFIDENCE_FLOOR` (0.5, here) and
+# `extract._POSSIBLE_CONFIDENCE_DISCOUNT` (0.5, there) were chosen
+# independently and land 0.05 apart in effect. An i2b2 `possible` fact starts
+# around 0.9 and is halved to ~0.45, i.e. JUST under this floor — so rule 3
+# below routes essentially EVERY hedged fact to `contradiction/low_confidence`
+# rather than letting it participate in supersede arbitration.
+#
+# Corpus-scale effect: 6,917 CONTRADICTS vs 4,271 SUPERSEDES across 20
+# patients; on subject 10912213, 196 of 860 claims (23%) sit at confidence
+# 0.34-0.43 and are contradiction-bound by construction.
+#
+# This is defensible and is NOT being changed here: decisions/002 is open, and
+# "a hedged fact can never close a firmer one" is the intended semantics. But
+# the *magnitude* is an artifact of two constants meeting, not a considered
+# calibration, and the contradiction rate should be read with that in mind.
+# Changing either number re-writes invalidation semantics corpus-wide and
+# requires a full re-ingest to observe.
+# ---------------------------------------------------------------------------
+
 # literature/09 Q1 rule 3: "only if it is not older than the current source
 # by more than a declared staleness window". Frozen at 0 for this story
 # (E4-S5.md): the lower-trust side overrides trust-class only if it is

@@ -230,8 +230,18 @@ class LexicalAnswerer(ReaderAnswerer):
             rendering=rendering, k=k, dry_run=dry_run, model=model, client=client, retriever=self._timed_retriever
         )
 
-    def answer(self, question: str, conversation: Conversation | None, *, patient_id: str) -> AnswerResult:
-        result = super().answer(question, conversation, patient_id=patient_id)
+    def answer(
+        self,
+        question: str,
+        conversation: Conversation | None,
+        *,
+        patient_id: str,
+        scope: str | None = None,
+        question_type: str | None = None,
+    ) -> AnswerResult:
+        result = super().answer(
+            question, conversation, patient_id=patient_id, scope=scope, question_type=question_type
+        )
         return replace(result, latency_ms=result.latency_ms + self._timed_retriever.last_latency_ms)
 
 

@@ -74,15 +74,20 @@ from __future__ import annotations
 
 import os
 import time
+import warnings
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Mapping
 
 import numpy as np
 
 from medmemgraph.contracts import RetrieveItem, RetrieveResult
-from medmemgraph.graph import fusion, schema, traverse
+from medmemgraph.graph import embedders, fusion, schema, traverse
 from medmemgraph.graph.existence import exists
 from medmemgraph.graph.lexical import LexicalIndex
+from medmemgraph.graph.reranker import reranker_from_env
 from medmemgraph.graph.router import DEFAULT_EPSILON, log_route_decision, route_eval, route_live
-from medmemgraph.graph.vector_index import PatientIndex, embed_texts
+from medmemgraph.graph.vector_index import DEFAULT_INDEX_DIR, PatientIndex, embed_texts
 from medmemgraph.hydra_client import HydraClient
 from medmemgraph.observability import span
 from medmemgraph.pipeline.ids import mint_patient_id
@@ -95,7 +100,14 @@ __all__ = [
     "seed_entity_ids",
     "register_indexes",
     "clear_index_cache",
+    "ReadPathConfig",
 ]
+
+DEFAULT_RERANK_CANDIDATES = 50
+"""Candidates fed to the reranker. `eval/retrieval_eval.py` sweeps at 100, a
+number measured on a GPU; on the CPU-only deployment target 100 candidates
+through a 0.6B causal reranker is seconds per query. 50 is the CPU-honest
+default, tunable via MEDMEMGRAPH_RERANK_CANDIDATES."""
 
 DEFAULT_SEED_K = 8
 """§7.2's own worked shape ("top entity integer ids") — 8 is a small,
@@ -121,7 +133,10 @@ budget" (that packing already happened via `rank_paths` + this module's own
 # Text arm — dense (NumPy) + lexical (bm25s), fused to `text_rank`.
 # ---------------------------------------------------------------------------
 
-_INDEX_CACHE: dict[tuple[str, str | None], tuple[PatientIndex, LexicalIndex]] = {}
+_INDEX_CACHE: dict[tuple[str, str | None, str], tuple[PatientIndex, LexicalIndex]] = {}
+"""Keyed by (patient_id, root, embedder_name). The embedder is part of the key
+because it became configurable: without it, swapping encoders mid-process
+silently reuses the first one's vectors."""
 
 
 def register_indexes(
@@ -130,6 +145,7 @@ def register_indexes(
     lexical: LexicalIndex,
     *,
     root: str | os.PathLike[str] | None = None,
+    embedder: str | None = None,
 ) -> None:
     """Pre-populate the module-level index cache for `patient_id` without
     going through `pipeline.loader.load_conversation` — the injection point
@@ -138,33 +154,120 @@ def register_indexes(
     caller that already builds/persists these indexes elsewhere (e.g. an
     ingest pipeline that calls `PatientIndex.save`/`.load` — see
     `vector_index.py`)."""
-    _INDEX_CACHE[(patient_id, str(root) if root is not None else None)] = (dense, lexical)
+    key_embedder = embedder or getattr(dense, "backend_name", None) or embedders.DEFAULT_BACKEND_NAME
+    _INDEX_CACHE[(patient_id, str(root) if root is not None else None, key_embedder)] = (
+        dense,
+        lexical,
+    )
+
+
+_PATIENT_ENTITY_CACHE: dict[int, list[tuple[int, str, str]]] = {}
+"""`patient_node_id -> [(entity_id, name, label)]`, cached per process.
+
+`_fetch_patient_entities` issues one labelled MATCH per domain label (7 queries)
+and takes ~15s against a real patient's subgraph — and `seed_entity_ids` calls
+it on EVERY question. Within one process the graph is static, so re-fetching per
+question is pure waste: 24 QA items for one patient cost ~6 minutes of identical
+queries.
+
+Deliberately not invalidated on a timer. The only writer is
+`pipeline/ingest.py`, which runs in its own process; a long-lived reader that
+needs to observe new ingests calls `clear_index_cache()`."""
 
 
 def clear_index_cache() -> None:
     """Test-hygiene helper: drop every cached index so the next call to
     `retrieve()` rebuilds/re-fetches from scratch."""
     _INDEX_CACHE.clear()
+    _PATIENT_ENTITY_CACHE.clear()
+
+
+@dataclass(frozen=True)
+class ReadPathConfig:
+    """Deployment knobs for the text arm, resolved once from the environment.
+
+    Every field is OFF or default-valued unless explicitly set, so an unset
+    environment reproduces the read path exactly as it behaved before these
+    knobs existed. They are environment variables rather than `retrieve()`
+    kwargs because the callers that need to vary them (`demo/agent.py`, the
+    eval harness, `scripts/`) are all processes, not call sites — and because
+    the point of the reranker seam is that a teammate can swap a checkpoint in
+    without editing code.
+
+        MEDMEMGRAPH_EMBED_BACKEND    embedder key (default: qwen3-0.6b)
+        MEDMEMGRAPH_INDEX_DIR        load saved indexes from here (default: data/index)
+        MEDMEMGRAPH_RERANKER         reranker key / HF id / local path (default: off)
+        MEDMEMGRAPH_RERANK_CANDIDATES  pool size to rerank (default: 50)
+
+    See `graph/reranker.py::spec_from_env` for the full reranker variable set.
+    """
+
+    embedder: str = embedders.DEFAULT_BACKEND_NAME
+    index_dir: Path | None = None
+    reranker: object | None = None
+    n_candidates: int = DEFAULT_RERANK_CANDIDATES
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> "ReadPathConfig":
+        env = os.environ if env is None else env
+        raw_dir = env.get("MEDMEMGRAPH_INDEX_DIR", str(DEFAULT_INDEX_DIR))
+        try:
+            n_candidates = int(env.get("MEDMEMGRAPH_RERANK_CANDIDATES") or DEFAULT_RERANK_CANDIDATES)
+        except ValueError:
+            n_candidates = DEFAULT_RERANK_CANDIDATES
+        return cls(
+            embedder=env.get("MEDMEMGRAPH_EMBED_BACKEND") or embedders.DEFAULT_BACKEND_NAME,
+            index_dir=Path(raw_dir) if raw_dir else None,
+            reranker=reranker_from_env(env),
+            n_candidates=n_candidates,
+        )
 
 
 def _get_indexes(
-    patient_id: str, *, root: str | os.PathLike[str] | None = None
+    patient_id: str,
+    *,
+    root: str | os.PathLike[str] | None = None,
+    cfg: ReadPathConfig | None = None,
 ) -> tuple[PatientIndex, LexicalIndex] | None:
     """Returns cached indexes, building+caching them on first use via the
     allowlisted loader (decisions/001). Returns `None` — never raises —
     when the patient has no ingestible conversation at all (never
     ingested, or a demo/test `patient_id` with no corpus backing): a
     missing text corpus degrades the text arm to `[]`, it does not fail
-    `retrieve()` (design decision 5, module docstring)."""
-    cache_key = (patient_id, str(root) if root is not None else None)
+    `retrieve()` (design decision 5, module docstring).
+
+    Tries a saved index (`cfg.index_dir`, written by
+    `scripts/ingest_corpus.py`) before rebuilding. A rebuild re-embeds every
+    turn of the patient's history — seconds per patient per process — which is
+    pure waste across an eval run of hundreds of items. `PatientIndex.load`
+    validates the saved `backend_name` and raises `BackendMismatchError` if it
+    does not match the configured embedder, so a stale index from a different
+    encoder can never be silently reused.
+
+    The embedder name is part of the cache key. It has to be: the moment the
+    encoder became configurable, a key of `(patient_id, root)` alone would hand
+    back vectors built by whichever embedder happened to run first in the
+    process."""
+    cfg = cfg or ReadPathConfig.from_env()
+    cache_key = (patient_id, str(root) if root is not None else None, cfg.embedder)
     cached = _INDEX_CACHE.get(cache_key)
     if cached is not None:
         return cached
+
+    if cfg.index_dir is not None:
+        try:
+            dense = PatientIndex.load(patient_id, cfg.index_dir, backend=cfg.embedder)
+            lexical = LexicalIndex.load(patient_id, cfg.index_dir)
+            _INDEX_CACHE[cache_key] = (dense, lexical)
+            return dense, lexical
+        except Exception:  # noqa: BLE001 — a cache miss/mismatch just means rebuild
+            pass
+
     try:
         conversation: Conversation = load_conversation(patient_id, root=root)
     except (LoaderError, FileNotFoundError, OSError):
         return None
-    dense = PatientIndex(patient_id)
+    dense = PatientIndex(patient_id, backend=cfg.embedder)
     dense.build(conversation)
     lexical = LexicalIndex(patient_id)
     lexical.build(conversation)
@@ -173,34 +276,70 @@ def _get_indexes(
 
 
 def _text_channel(
-    patient_id: str, question: str, k: int, *, root: str | os.PathLike[str] | None = None
+    patient_id: str,
+    question: str,
+    k: int,
+    *,
+    root: str | os.PathLike[str] | None = None,
+    cfg: ReadPathConfig | None = None,
 ) -> tuple[list[RetrieveItem], dict[str, float]]:
     """Always-built dense+lexical arm (ARCHITECTURE §7.5 step 1: "Always
     build dense + lexical. Fuse to `text_rank` via RRF.") — cheap relative
     to a graph walk, run regardless of route so the graph route's own
     "did text contribute anything unique" check (§7.5 step 3) has
-    something to compare against."""
-    latency = {"vector": 0.0, "lexical": 0.0}
-    indexes = _get_indexes(patient_id, root=root)
+    something to compare against.
+
+    The optional cross-encoder rerank stage lives HERE, on the text arm, and
+    deliberately not on the final graph+text fusion. Graph items' `.text` is
+    `traverse.serialize_paths(...)` — a rendered path, not prose — so a
+    cross-encoder trained on clinical dialogue is out of distribution on them
+    and would score them arbitrarily. The realistic failure is that it
+    systematically demotes every real graph path, silently deleting the graph
+    arm's contribution while `route` still reports `"graph"`. Reranking the text
+    arm only also keeps the live path identical in shape to what
+    `eval/retrieval_eval.py` measures."""
+    cfg = cfg or ReadPathConfig.from_env()
+    latency = {"vector": 0.0, "lexical": 0.0, "rerank": 0.0}
+    indexes = _get_indexes(patient_id, root=root, cfg=cfg)
     if indexes is None:
         return [], latency
     dense, lexical = indexes
 
+    # Widen the candidate pool only when something will actually re-rank it.
+    n_cand = k if cfg.reranker is None else max(k, cfg.n_candidates)
+
     t0 = time.monotonic()
-    with span("search", kind="RETRIEVER", channel="vector", k=k) as sp:
-        dense_hits = dense.search(question, k)
+    with span("search", kind="RETRIEVER", channel="vector", k=n_cand) as sp:
+        dense_hits = dense.search(question, n_cand)
         sp.set_attribute("candidate_count", len(dense_hits))
     latency["vector"] = (time.monotonic() - t0) * 1000
 
     t0 = time.monotonic()
-    with span("search", kind="RETRIEVER", channel="lexical", k=k) as sp:
-        lexical_hits = lexical.search(question, k)
+    with span("search", kind="RETRIEVER", channel="lexical", k=n_cand) as sp:
+        lexical_hits = lexical.search(question, n_cand)
         sp.set_attribute("candidate_count", len(lexical_hits))
     latency["lexical"] = (time.monotonic() - t0) * 1000
 
     with span("fuse", kind="CHAIN", channel="text") as sp:
         fused = fusion.rrf_fuse([dense_hits, lexical_hits])
         sp.set_attribute("candidate_count", len(fused))
+
+    if cfg.reranker is None:
+        # Byte-identical to the pre-reranker behaviour. Note this is an early
+        # return rather than running a NoopReranker: `NoopReranker.rerank`
+        # synthesizes descending scores, so routing the default path through it
+        # would overwrite every `RetrieveItem.score`.
+        return fused, latency
+
+    t0 = time.monotonic()
+    with span("rerank", kind="RERANKER", channel="text", model=cfg.reranker.name) as sp:
+        ranked = cfg.reranker.rerank(question, [item.text for item in fused], top_k=None)
+        # Truncate to 2*k — exactly the width RRF over two k-deep lists produced
+        # before, so the downstream graph+text fusion sees the same cardinality
+        # it always did, only reordered.
+        fused = [replace(fused[i], score=score) for i, score in ranked][: 2 * k]
+        sp.set_attribute("candidate_count", len(fused))
+    latency["rerank"] = (time.monotonic() - t0) * 1000
     return fused, latency
 
 
@@ -216,7 +355,14 @@ def _fetch_patient_entities(client: HydraClient, patient_node_id: int) -> list[t
     entities under a given label simply contributes nothing for that
     label — never invented. Returns `(node_id, name, label)` triples,
     de-duplicated by `node_id` (the same entity can be `ABOUT`-linked from
-    more than one `:Claim`)."""
+    more than one `:Claim`).
+
+    Cached per `patient_node_id` for the life of the process
+    (`_PATIENT_ENTITY_CACHE`): this is 7 labelled queries costing ~15s against a
+    real patient, and `seed_entity_ids` needs it on every single question."""
+    cached = _PATIENT_ENTITY_CACHE.get(patient_node_id)
+    if cached is not None:
+        return cached
     seen: dict[int, tuple[str, str]] = {}
     for label in sorted(schema.DOMAIN_ENTITY_LABELS):
         rows = client.run(
@@ -228,8 +374,9 @@ def _fetch_patient_entities(client: HydraClient, patient_node_id: int) -> list[t
             node_id = row["id"]
             if node_id not in seen:
                 seen[node_id] = (str(row.get("name") or ""), label)
-    return [(node_id, name, label) for node_id, (name, label) in seen.items()]
-
+    result = [(node_id, name, label) for node_id, (name, label) in seen.items()]
+    _PATIENT_ENTITY_CACHE[patient_node_id] = result
+    return result
 
 def seed_entity_ids(
     client: HydraClient, patient_node_id: int, question: str, *, k: int = DEFAULT_SEED_K
@@ -251,8 +398,11 @@ def seed_entity_ids(
         return {}
     names = [name for _, name, _ in entities]
     with span("embed", kind="EMBEDDING", entity_count=len(entities)) as sp:
-        query_vec = embed_texts([question])[0]
-        name_vecs = embed_texts(names)
+        # Asymmetric encoding: the question is a QUERY, the entity names are
+        # documents. See `vector_index.embed_texts`'s own note on why encoding
+        # both sides the same way collapses the score margins.
+        query_vec = embed_texts([question], is_query=True)[0]
+        name_vecs = embed_texts(names, is_query=False)
         sp.set_attribute("vector_count", len(names) + 1)
     scores = name_vecs @ query_vec
     top_n = min(k, len(entities))
@@ -451,7 +601,14 @@ def _retrieve_impl(
     blocks inline at each stage boundary — see `retrieve()`'s own docstring
     for the full public contract."""
     start = time.monotonic()
-    latency_ms: dict[str, float] = {"search": 0.0, "total": 0.0, "graph": 0.0, "vector": 0.0, "lexical": 0.0}
+    latency_ms: dict[str, float] = {
+        "search": 0.0,
+        "total": 0.0,
+        "graph": 0.0,
+        "vector": 0.0,
+        "lexical": 0.0,
+        "rerank": 0.0,
+    }
 
     with span("route", kind="CHAIN", question_type=question_type, scope=scope) as sp:
         if scope is not None or question_type is not None:
@@ -463,9 +620,15 @@ def _retrieve_impl(
         question=question, features={"scope": scope, "question_type": question_type}, decision=decision
     )
 
-    text_rank, text_latency = _text_channel(patient_id, question, k, root=root)
+    cfg = ReadPathConfig.from_env()
+    text_rank, text_latency = _text_channel(patient_id, question, k, root=root, cfg=cfg)
     latency_ms["vector"] = text_latency["vector"]
     latency_ms["lexical"] = text_latency["lexical"]
+    # Copy EVERY key the text arm reports, not a hardcoded two. `rerank` was
+    # added to `_text_channel`'s latency dict but not here, so the reranker's
+    # cost — the single number the CPU-deployability decision rests on — was
+    # measured, discarded, and reported as 0.0 to every caller.
+    latency_ms.update(text_latency)
 
     if decision.route == "vector":
         # §7.1's own 26-point / 100-350x lesson: do NOT pay for a graph
@@ -543,10 +706,25 @@ def _retrieve_impl(
             paths=[_path_payload(p) for p in ranked_paths],
             latency_ms=latency_ms,
         )
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — never raise out of the public function
         # E5-S4 AC4, extended to the graph arm: never raise out of the
         # public function. Whatever the text arm already produced still
         # answers the question, honestly labelled "vector".
+        #
+        # WARN, don't swallow. Degrading silently here hid a total graph-arm
+        # outage for an entire eval run on 2026-08-18: `algo.MSpaths` was
+        # exceeding HydraDB's 30s query timeout on every real-scale patient
+        # (see `traverse.DEFAULT_REL_TYPES` for the cause and fix), and because
+        # this handler produced a perfectly well-formed vector-route result, the
+        # numbers looked plausible and nothing anywhere said the graph had not
+        # run. The degrade is still correct — a partial answer beats an
+        # exception — but it must be audible.
+        warnings.warn(
+            f"graph arm failed for patient_id={patient_id!r}; degrading to the "
+            f"text arm and reporting route='vector'. {type(exc).__name__}: {exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         latency_ms["total"] = (time.monotonic() - start) * 1000
         return RetrieveResult(
             items=text_rank[:k], route="vector", structural_absence=False, paths=[], latency_ms=latency_ms

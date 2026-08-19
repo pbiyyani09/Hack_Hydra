@@ -52,18 +52,116 @@ us](#what-hydradb-oss-does-not-give-us).
 ## Quickstart
 
 ```bash
-bash scripts/run_hydradb.sh                                    # boot HydraDB OSS, wait on :9090/readyz
+bash scripts/run_hydradb.sh                                     # boot HydraDB OSS, wait on :9090/readyz
 bash scripts/download_medlocomo.sh                              # fetch MedLoCoMo into data/ (gitignored, never vendored)
-uv sync && uv run pytest -q                                     # install + freeze-bar tests
-uv run python -m medmemgraph.demo.agent --patient <patient_id>  # chat with one patient's memory
+uv sync --extra dev && uv run pytest -q -m "not live"            # install + offline tests
+uv run python scripts/ingest_corpus.py --limit 3                 # extract -> resolve -> write the graph
+uv run python -m medmemgraph.demo.agent --patient <patient_id>   # chat with one patient's memory
 ```
 
 `<patient_id>` is one of the subject-id directories under
 `data/medlocomo/MedLoCoMo/` after the fetch step (101 of them; see
-[Data](#data)). No API key is required to boot HydraDB or run the tests.
-An LLM API key is required for real extraction and real answers; without
-one, the LLM-dependent components fall back to deterministic stand-ins
-(clearly labelled; see [Results](#results)).
+[Data](#data)).
+
+**The ingest step is not optional.** Every graph-route answer, the
+`structural_absence` abstention signal, and the provenance walk read state that
+only `scripts/ingest_corpus.py` writes; against an empty graph `retrieve()`
+degrades to the text arm and the demo silently has no paths to show. Ingest
+costs about **$0.15 and 3-12 minutes per patient** (one LLM call per admission);
+`llm.py` caches every completion to disk, so a re-run after a restart is
+essentially free.
+
+Ingest is gated on a human hand-check (`fixtures/handcheck/`) — see
+[Scale gate](#scale-gate) below. No API key is required to boot HydraDB or run
+the offline tests. Real extraction and real answers need an OpenAI key and a
+Google key (see [Configuration](#configuration)).
+
+## Configuration
+
+Put these in a gitignored `.env` at the repo root:
+
+| variable | used for |
+|---|---|
+| `OPENAI_API_KEY` | the reader / answerer (`gpt-4.1-mini`) |
+| `GOOGLE_API_KEY` | extraction, the LLM judge, entity-match adjudication (`gemini-3.5-flash-lite`) |
+| `HYDRA_AUTH_TOKEN` | must match the token file `scripts/run_hydradb.sh` writes |
+| `MEDLOCOMO_ROOT` | corpus parent dir (default `data/medlocomo`) |
+| `MEDMEMGRAPH_MAX_USD` | cumulative spend cap, default `$5.00` |
+
+Two providers on purpose: the judge is a **different model family** from the
+answerer, so a model is never grading its own output.
+
+Optional read-path knobs — all off/default unless set:
+
+| variable | default | effect |
+|---|---|---|
+| `MEDMEMGRAPH_EMBED_BACKEND` | `qwen3-0.6b` | bi-encoder for the dense arm |
+| `MEDMEMGRAPH_RERANKER` | *(off)* | registry key, HF id, **or a local checkpoint directory** |
+| `MEDMEMGRAPH_RERANKER_KIND` | `seq_classification` | or `causal_yesno` |
+| `MEDMEMGRAPH_RERANK_CANDIDATES` | `50` | pool size handed to the reranker |
+| `MEDMEMGRAPH_INDEX_DIR` | `data/index` | load saved indexes instead of rebuilding |
+
+### Running with no API account at all
+
+Every LLM role accepts a `local:` model id, which loads HuggingFace weights on
+this machine instead of calling a provider. No key, no per-token cost, no rate
+limit:
+
+```bash
+export MEDMEMGRAPH_ANSWER_MODEL="local:Qwen/Qwen2.5-7B-Instruct"
+export MEDMEMGRAPH_LOCAL_DEVICE=cuda     # or cpu; defaults to cuda when available
+export MEDMEMGRAPH_LOCAL_DTYPE=float16   # float32 on cpu
+export MEDMEMGRAPH_LOCAL_MAX_INPUT_TOKENS=8192
+```
+
+Anything after `local:` goes straight to `from_pretrained`, so a local directory
+works as well as a Hub id — the same handoff shape as the reranker.
+
+**Measured, not assumed** (6 patients, 204 items, same questions and same judge,
+only the answerer swapped — `Qwen2.5-7B-Instruct` in 8-bit on a 16 GB card):
+
+| | local 7B-8bit | `gpt-4.1-mini` |
+|---|---:|---:|
+| Answerable accuracy | 0.422 | **0.539** |
+| Abstention accuracy | **0.889** | 0.722 |
+| Latency / item | 23.3 s* | 5.2 s |
+| Cost | **$0.00** | ~$0.04 / patient |
+
+\* the GPU was shared with an ingest job during this run; isolated generation
+was ~0.7 s.
+
+Answerable accuracy was lower on **all six patients**, so the gap is a real
+capability difference rather than variance, and the headline tables above stay on
+`gpt-4.1-mini`. What the local model is good for is **iteration at zero cost**
+(measure a retrieval change locally, confirm it once on the API) and
+**reproducibility** — a reader with no API account can clone this repo and get
+real numbers.
+
+The abstention direction is worth noting on its own: the local model declines
+more often (0.889 vs 0.722) and answers less. For a clinical memory layer that is
+the safer of the two failure directions, though it is not free — it is exactly
+the recall it gives up.
+
+Two honest limits:
+
+- **Structured output is prompted, not constrained.** OpenAI and Google both do
+  native schema-constrained decoding; `transformers` alone does not. A `schema=`
+  becomes an instruction and the existing schema-retry loop parses the result.
+  `literature/17` records that prompted JSON mode can cost real accuracy versus
+  constrained decoding, so a local model is a good fit for bulk generation and a
+  questionable one for the schema-heavy extraction path until measured on your
+  own data.
+- **`fullctx` will not fit.** That baseline builds ~80K-token prompts by design;
+  a 7B model's weights plus an 80K KV cache exceed a 16 GB card. Run the
+  retrieval systems locally and `fullctx` against an API, or quantize.
+
+The judge is worth keeping on a hosted model even when the answerer is local —
+it is cheap (a few dollars for a full run) and keeping it in a **different model
+family from the answerer** is what stops a model grading its own output.
+
+`MEDMEMGRAPH_MAX_USD` is a **cumulative** cap: the ledger at
+`data/llm_cache/ledger.json` persists across runs, so spend accumulates until
+you reset it.
 
 ## Setup, step by step
 
@@ -124,7 +222,7 @@ bash scripts/download_medlocomo.sh
 
 This clones `github.com/leozzy13/MedLoCoMo` into `${MEDLOCOMO_ROOT:-data/medlocomo}`,
 which is gitignored. **This repository never ships the corpus.** See
-[Data](#data) for why, and [decisions/001](collaborative/decisions/001-medlocomo-packet-leakage.md)
+[Data](#data) for why, and the `pipeline/loader.py` module docstring
 if you have access to the design workspace.
 
 Ingestion reads exactly one file per patient,
@@ -148,7 +246,44 @@ and only run once step 1 is up; the rest run with no external
 dependencies at all (`uv run pytest -q -m "not live"` if HydraDB is not
 running).
 
-### 4. Talk to a patient's memory
+### 4. Ingest patients into the graph
+
+```bash
+uv run python scripts/ingest_corpus.py --limit 20
+```
+
+Per patient: load the conversation, extract clinical facts (one LLM call per
+admission), resolve entities against everything ingested so far, write
+`:Claim` nodes with `SUPERSEDES`/`CONTRADICTS` edges, write the `:Turn`
+provenance layer, and save the dense + lexical indexes. Roughly **$0.15 and
+3-12 minutes per patient**; `id_map`/`registry` are persisted after every
+patient, so a crash at patient 17 does not discard the entity resolution done
+for 1-16, and a re-run replays from the LLM cache at ~$0.
+
+A reference run over 20 patients produced 13,406 facts (**0 skipped**), 30,086
+`:Turn` nodes, 4,271 `SUPERSEDES` and 6,917 `CONTRADICTS` edges.
+
+<a id="scale-gate"></a>
+#### The scale gate
+
+`ingest_patient()`'s first line is `assert_handcheck_passed()`, which fails
+closed unless `fixtures/handcheck/PASSED` exists. That file must be written by
+a **human**, after reading `fixtures/handcheck/CHECKLIST.md`'s 30 real
+extracted facts against their source turns and filling the `human: ok/bad`
+column. No coding agent may write it.
+
+To regenerate the checklist against the current extractor:
+
+```bash
+uv run python scripts/handcheck_extract.py     # rewrites CHECKLIST.md + facts.jsonl
+# review the rows, then:
+echo "reviewed by <you>, <date>" > fixtures/handcheck/PASSED
+```
+
+The gate exists because extraction quality is the one thing no test can
+assert. It is deliberately annoying.
+
+### 5. Talk to a patient's memory
 
 ```bash
 uv run python -m medmemgraph.demo.agent --patient <patient_id>
@@ -160,6 +295,24 @@ question took (`graph` / `vector` / `hybrid`), whether the graph reported
 `structural_absence`, citations (`session_id` / `turn_ids`), token count,
 and latency. If the graph reports absence, or the reader abstains, it
 prints `Not in this record` rather than guessing.
+
+Routing is deterministic here (`--epsilon 0`); `retrieve()`'s live default of
+`0.05` flips roughly one question in twenty to the other arm to keep offline
+policy evaluation possible, which is the wrong trade for a demo or a recording.
+
+### 6. Walk a fact's revision history
+
+```bash
+uv run python -m medmemgraph.demo.provenance --patient <patient_id> --predicate CURRENT_DOSAGE_OF
+```
+
+Prints every version of a claim, the `SUPERSEDES`/`CONTRADICTS` edge between
+each pair, and the dialogue turn that produced each one. Omit `--claim` and it
+finds a claim that actually has a chain, so there is no id to copy by hand.
+
+This is the query the whole design exists for: nothing is deleted, so "why do
+you believe this, and what did you believe before?" is a bounded path walk with
+quoted evidence at every hop.
 
 ## The HydraDB dependency, in detail
 
@@ -226,74 +379,164 @@ by construction, enforced by `tests/test_loader_allowlist.py`.
 
 ## Results
 
-**There are no results here yet.** As of this writing, no managed LLM API
-key is configured in the environment this README was written in, so every
-LLM-dependent component (extraction, the Chain-of-Note reader, the LLM
-judge) runs on a deterministic fallback. Fallback numbers are not quality
-signals; do not read anything below as a benchmark result until the freeze
-run replaces it.
+Real numbers from a real run. **10 patients, 336 paired QA items per system**,
+stratified 6-per-question-type with a fixed seed so every system saw exactly the
+same items (the paired McNemar test below depends on that). Judge:
+`gemini-3.5-flash-lite`, a different model family from the `gpt-4.1-mini`
+answerer, so no model grades its own output.
 
-You can run the harness right now, with no API key, and get a real (if
-uninteresting) number back, because the fallback path is itself real code:
+| System | Answerable acc (95% CI) | Abstention acc | Mean tokens | p50 latency | p95 latency |
+|---|---|---|---:|---:|---:|
+| Full-context | **0.757** [0.703, 0.804] | 0.517 | 80,557 | 17,748 ms | 31,058 ms |
+| Lexical (BM25 + window) | 0.558 [0.499, 0.615] | 0.633 | 2,690 | 5,295 ms | 10,314 ms |
+| **MedMemGraph** (graph/vector router + Chain-of-Note) | 0.536 [0.477, 0.594] | **0.717** | **1,937** | 6,227 ms | 9,405 ms |
+| Dense (chunked RAG) | 0.457 [0.399, 0.515] | 0.750 | 2,511 | 4,752 ms | 8,536 ms |
+| No-memory | 0.101 [0.071, 0.143] | 0.917 | 162 | 585 ms | 1,557 ms |
+
+**Abstention** is reported as its own column and never folded into answerable
+accuracy — `eval/report.py` makes emitting a blended number impossible at the
+API level. Precision is 1.00 for every system (when they abstain, the item
+really was unanswerable); the differences are all in recall.
+
+No-memory's 0.917 abstention is not a result — a system with no patient data
+abstains on nearly everything. It is the sanity floor: at 0.101 answerable it
+confirms the benchmark cannot be answered from general medical knowledge.
+
+### Paired significance (Holm-Bonferroni adjusted, vs full-context)
+
+| System | n paired | p (adjusted) | Reject H0 | MDE@n |
+|---|---:|---:|---|---:|
+| MedMemGraph | 336 | < 0.0001 | yes | 0.076 |
+| Lexical | 336 | < 0.0001 | yes | 0.070 |
+| Dense | 336 | < 0.0001 | yes | 0.082 |
+| No-memory | 336 | < 0.0001 | yes | 0.097 |
+
+The 0.221 answerable-accuracy gap between full-context and MedMemGraph is far
+larger than the 0.076 minimum detectable effect at this sample size. **It is a
+real difference, not noise, and we are not going to describe it as anything
+else.**
+
+### The claim, stated plainly
+
+> Full-context has higher aggregate answerable accuracy than MedMemGraph on this
+> benchmark. MedMemGraph's case is a Pareto one on cost, not on raw accuracy: a
+> fraction of the tokens and latency, comparable-to-lower answerable accuracy,
+> and wins on the abstention slice where full-context struggles most. We are not
+> claiming an accuracy win over full-context.
+
+Concretely, against full-context MedMemGraph uses **41.6x fewer tokens**
+(1,937 vs 80,557), runs **2.85x faster at p50**, and abstains far better
+(0.717 vs 0.517) — the failure mode the Track 03 brief names for long-context
+models, measured here rather than quoted.
+
+Every system is **Pareto-non-dominated** on (accuracy, tokens): no system beats
+another on both axes at once. MedMemGraph is the cheapest system on the frontier
+that still answers most questions.
+
+### Cross-encoder reranking: +10.5 points, p = 0.00016
+
+The retrieval stage can be improved by reranking the candidate pool with a
+trained cross-encoder before the reader sees it. Measured as a controlled A/B —
+**same 10 patients, same 276 answerable items, same answerer and judge, only the
+reranker toggled** (`MEDMEMGRAPH_RERANKER=qwen3-rerank-0.6b`):
+
+| | reranker off | reranker on |
+|---|---|---|
+| Answerable accuracy | 0.536 [0.477, 0.594] | **0.641** [0.583, 0.696] |
+| Abstention accuracy | 0.717 | 0.650 |
+
+Paired McNemar: **p = 0.00016**, with **42 items flipping wrong -> right against
+13 flipping right -> wrong**. The gain was positive on all 10 patients
+individually (+0.033 to +0.222).
+
+Per category, the improvement lands where retrieval was weakest:
+
+| Category | off | on | delta |
+|---|---:|---:|---:|
+| longitudinal_progression | 0.267 | **0.467** | **+0.200** |
+| medical_reasoning | 0.767 | 0.917 | +0.150 |
+| care_plan_rationale | 0.900 | 0.967 | +0.067 |
+| frequency_pattern | 0.438 | 0.500 | +0.062 |
+| cross_admission_comparison | 0.229 | 0.250 | +0.021 |
+| adversarial (abstention) | 0.717 | 0.650 | −0.067 |
+
+`longitudinal_progression` nearly doubling confirms the diagnosis in the section
+below: those were **retrieval** failures, not reasoning failures — the reader
+was doing fine with poor evidence. The 6.7-point abstention cost is the one
+trade: sharper retrieval surfaces plausible evidence more often, so the system
+declines less.
+
+With reranking on, MedMemGraph moves **ahead of lexical BM25** (0.641 vs 0.558)
+rather than tied with it, and the gap to full-context narrows from 22 points to
+12 while still using ~40x fewer tokens. It does not overturn the honest-loss
+framing above.
+
+**Retrieval-stage evidence** (`eval/retrieval_eval.py`, no LLM, no API cost),
+turn-level grounding, n=231:
+
+| reranker | Hit@2 | Hit@10 | nDCG@10 | latency/query (GPU) | latency/query (CPU) |
+|---|---:|---:|---:|---:|---:|
+| none | 0.377 | 0.606 | 0.302 | — | — |
+| `ms-marco-minilm-l6-v2-onnx-int8` | 0.576 | 0.797 | 0.460 | 108 ms | **0.1 s** |
+| `qwen3-rerank-0.6b` | **0.654** | **0.818** | **0.515** | 242 ms | 9.5 s |
+
+Both beat the no-rerank control at p < 0.0001 (Holm-adjusted; paired MDE 4.5pp
+against deltas of 9.1-9.3pp — not underpowered).
+
+The two arms differ by **95x on CPU** and only 2.2x on GPU, because a
+`causal_yesno` reranker runs a full causal-LM forward pass per candidate while a
+`seq_classification` head emits one scalar per pair. For CPU deployment the
+small classification-head model is the only viable shape; the quality gap it
+needs to close is Hit@2 0.576 -> 0.654.
+
+Reranking is **off by default** (`MEDMEMGRAPH_RERANKER` unset) so the baseline
+read path is unchanged unless explicitly enabled.
+
+### The honest weak spot
+
+MedMemGraph is statistically tied with plain lexical BM25 on answerable accuracy
+(0.536 vs 0.558). **The graph is not beating a well-engineered keyword baseline
+at getting answers right.** Where it does lead the retrieval systems is the
+cross-admission categories and abstention:
+
+| Category | MedMemGraph | Lexical | Dense | Full-context |
+|---|---:|---:|---:|---:|
+| cross_admission_comparison | **0.229** | 0.208 | 0.204 | 0.611 |
+| frequency_pattern | **0.438** | 0.354 | 0.259 | 0.574 |
+| longitudinal_progression | 0.267 | 0.350 | 0.288 | 0.621 |
+| adversarial (abstention) | **0.717** | 0.633 | 0.750* | 0.517 |
+
+\* dense abstains more often overall, at the cost of the lowest answerable
+accuracy of any retrieval system.
+
+Those per-category margins sit inside the per-category MDE, so they are
+**suggestive, not established**. Reading the failures, the wrong answers are
+typically *incomplete* rather than wrong-entity: the graph supplies the
+structure (what changed, when) while the clinical reasoning (why) lives in the
+source turn text. Attaching each claim's `DRAWN_FROM` turn to its path item is
+the obvious next lever and is not yet implemented.
+
+### Reproducing this
 
 ```bash
-uv run python -m medmemgraph.eval.harness --patient <patient_id> --system nomem --dry-run
+bash scripts/run_hydradb.sh
+bash scripts/download_medlocomo.sh
+uv run python scripts/ingest_corpus.py --limit 20        # ~$2.75, ~4h
+PER_TYPE=6 SEED=0 bash scripts/run_eval.sh                # ~$30
+uv run python -m medmemgraph.eval.report --markdown
 ```
 
-This exercises a stub answerer and a deterministic token-overlap judge. It
-confirms the harness runs end to end, nothing more; it is not evidence of
-anything about memory quality.
+Costs are dominated by full-context (~85% of LLM spend: it puts the entire
+patient history in every prompt by design). `llm.py` caches every completion to
+disk, so a re-run is close to free.
 
-<!--
-RESULTS: filled at freeze from the eval harness output.
-  uv run python -m medmemgraph.eval.harness --patient <id> --system nomem fullctx reader_direct reader_con
-  Per-category + abstention aggregation from src/medmemgraph/eval/metrics.py (E7-S3: mcnemar_pvalue,
-  wilson_interval, paired_bootstrap, abstention_prf, token_f1). Every cell below is a placeholder,
-  not a measurement. Do not fill this table with anything that is not the output of a real run.
--->
+### Scale of the ingested graph
 
-**Answerable categories** (judge accuracy; abstention is reported
-separately below, never blended into this table):
-
-| System | medical_reasoning | care_plan_rationale | longitudinal_progression | cross_admission_comparison | frequency_pattern | mean tokens | p50 latency (ms) | p95 latency (ms) |
-|---|---|---|---|---|---|---|---|---|
-| No-memory | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| Full-context | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-| MedMemGraph (graph/vector router + Chain-of-Note) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD |
-
-**Abstention** (adversarial slice, precision/recall/F1, gold = "the
-question is not answerable"; a required row, never folded into the table
-above):
-
-| System | Precision | Recall | F1 | n |
-|---|---|---|---|---|
-| No-memory | TBD | TBD | TBD | TBD |
-| Full-context | TBD | TBD | TBD | TBD |
-| MedMemGraph | TBD | TBD | TBD | TBD |
-
-Paired McNemar p-values (MedMemGraph vs. full-context) and 95% Wilson
-confidence intervals per category ship in `results/*.json` and
-`eval/metrics.py` output; summarized here at freeze if they change the
-read of the table above.
-
-**The claim, stated plainly (pick exactly one of the two paragraphs below
-at freeze and delete the other):**
-
-> Comparable accuracy at a fraction of tokens and latency; wins
-> concentrated on cross-admission synthesis, temporal update, and
-> abstention. Not a raw accuracy win over full-context.
-
-> Full-context has higher aggregate answerable accuracy than MedMemGraph
-> on this benchmark. MedMemGraph's case is a Pareto one on cost, not on
-> raw accuracy: a fraction of the tokens and latency, comparable-to-lower
-> answerable accuracy, and wins on the cross-admission, temporal, and
-> abstention slices where full-context struggles most. We are not claiming
-> an accuracy win over full-context.
-
-We are not claiming a raw-accuracy win over full-context, and we are not
-going to. Prior work on episodic-memory layers for LLMs generally does not
-win on raw accuracy against long context either; if the same holds here,
-that is stated above in plain words, not buried.
+20 patients: **13,406 facts written, 0 skipped**, 30,086 `:Turn` nodes, 4,271
+`SUPERSEDES` and 6,917 `CONTRADICTS` edges. On the contradiction rate, see the
+measured note above `POSSIBLE_CONFIDENCE_FLOOR` in `graph/invalidate.py` — it is
+inflated by an interaction between two independently chosen constants, and is
+reported rather than tuned away.
 
 ## What HydraDB OSS does not give us
 

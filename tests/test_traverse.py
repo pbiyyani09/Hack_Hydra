@@ -264,6 +264,16 @@ def _link(client: HydraClient, src_label: str, src_id: int, dst_label: str, dst_
     return edge_id
 
 
+# `HAS` (Patient -> Claim) was removed from `traverse.DEFAULT_REL_TYPES` on
+# 2026-08-18 because it routes walks through the `:Patient` hub and blows past
+# HydraDB's 30s query timeout at real corpus scale (see that constant's own
+# docstring). The live tests below are testing the TRAVERSAL MACHINERY — "can
+# this walk a Patient-HAS-Claim-ABOUT-Medication path at all" — which is still
+# a supported capability, not the retrieval policy the default now encodes. So
+# they ask for `HAS` explicitly instead of relying on the default.
+WITH_HUB_EDGE = ("HAS", "ABOUT", "SUPERSEDES", "CONTRADICTS")
+
+
 @pytest.mark.live
 def test_known_two_hop_path_is_found(client: HydraClient) -> None:
     """Patient -HAS-> Claim -ABOUT-> Medication, exactly one 2-hop path."""
@@ -276,7 +286,7 @@ def test_known_two_hop_path_is_found(client: HydraClient) -> None:
     _link(client, "Patient", pid, "Claim", cid, "HAS")
     _link(client, "Claim", cid, "Medication", med_id, "ABOUT")
 
-    paths = tr.paths_between(client, [pid], [med_id], seed_label="Patient", target_label="Medication")
+    paths = tr.paths_between(client, [pid], [med_id], seed_label="Patient", target_label="Medication", rel_types=WITH_HUB_EDGE)
     assert len(paths) == 1
     path = paths[0]
     assert path.hop_count == 2
@@ -308,7 +318,7 @@ def test_known_three_hop_path_is_found(client: HydraClient) -> None:
     _link(client, "Claim", cnew, "Claim", cold, "SUPERSEDES")
     _link(client, "Claim", cold, "Medication", med_id, "ABOUT")
 
-    paths = tr.paths_between(client, [pid], [med_id], seed_label="Patient", target_label="Medication", max_len=4)
+    paths = tr.paths_between(client, [pid], [med_id], seed_label="Patient", target_label="Medication", max_len=4, rel_types=WITH_HUB_EDGE)
     assert len(paths) == 1
     path = paths[0]
     assert path.hop_count == 3
@@ -329,7 +339,7 @@ def test_maxlen_above_16_is_clamped_and_query_still_succeeds(client: HydraClient
 
     with pytest.warns(UserWarning, match="clamping"):
         paths = tr.paths_between(
-            client, [pid], [med_id], seed_label="Patient", target_label="Medication", max_len=9001
+            client, [pid], [med_id], seed_label="Patient", target_label="Medication", max_len=9001, rel_types=WITH_HUB_EDGE
         )
     assert len(paths) == 1  # the (clamped, engine-accepted) call still ran and found the path
 
@@ -355,7 +365,7 @@ def test_valid_time_filtering_drops_a_closed_interval_path_end_to_end(client: Hy
     _link(client, "Patient", pid, "Claim", cold, "HAS")
     _link(client, "Claim", cold, "Medication", med_id, "ABOUT")
 
-    paths = tr.paths_between(client, [pid], [med_id], seed_label="Patient", target_label="Medication")
+    paths = tr.paths_between(client, [pid], [med_id], seed_label="Patient", target_label="Medication", rel_types=WITH_HUB_EDGE)
     assert len(paths) == 1  # algo.MSpaths itself doesn't know or care that this claim is closed
 
     as_of_after_close = "2026-06-01T00:00:00"
@@ -394,13 +404,13 @@ def test_safety_filter_rejects_a_selector_value_collision_across_patients(client
     # BOTH med_a and med_b, but med_b is not reachable from patient A's own
     # subgraph, so this should still legitimately return nothing.
     cross_patient = tr.paths_between(
-        client, [pid_a], [med_b], seed_label="Patient", target_label="Medication"
+        client, [pid_a], [med_b], seed_label="Patient", target_label="Medication", rel_types=WITH_HUB_EDGE
     )
     assert cross_patient == []
 
     # Sanity: patient A really can reach ITS OWN same-named medication.
     same_patient = tr.paths_between(
-        client, [pid_a], [med_a], seed_label="Patient", target_label="Medication"
+        client, [pid_a], [med_a], seed_label="Patient", target_label="Medication", rel_types=WITH_HUB_EDGE
     )
     assert len(same_patient) == 1
     assert same_patient[0].end_id == med_a

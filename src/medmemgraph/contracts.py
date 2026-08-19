@@ -71,6 +71,82 @@ VALID_POLARITIES = frozenset({"asserted", "negated"})
 VALID_SOURCE_CLASSES = frozenset({"doctor", "patient"})
 
 # ---------------------------------------------------------------------------
+# Entity-type vocabulary (2026-08-17 silent-skip bug fix)
+# ---------------------------------------------------------------------------
+
+DOMAIN_ENTITY_TYPES = frozenset(
+    {"Condition", "Medication", "Allergy", "Symptom", "Procedure", "Provider", "Dosage"}
+)
+"""Canonical `EntityRef.type` values for a claim's object. `graph/schema.py`
+derives `DOMAIN_ENTITY_LABELS` from this set, so the wire vocabulary and the
+graph label vocabulary cannot drift apart.
+
+Lives here, not in `graph/schema.py`, because `EntityRef.type` is decided in
+Pipeline (`pipeline/extract.py`) and is consumed by THREE places that never
+call `schema.label_for`:
+
+  - `pipeline/ids.py::mint_entity_id` folds the type string into the minted
+    node id hash (`<Type>|<patient_id>|<normalized_name>`);
+  - `pipeline/resolve.py::block` partitions mentions on `(patient_id, entity_type)`;
+  - `graph/writer.py` stores it verbatim as the node's `type` property.
+
+That is why normalization must happen at emit time in `extract.py` and NOT by
+loosening `schema.label_for`: a case-insensitive `label_for` would still let
+`medication` and `Medication` mint two different ids and land in two different
+blocking partitions, silently producing duplicate `:Medication` nodes with the
+same `name` — a bug the label layer cannot see."""
+
+ENTITY_TYPE_ALIASES: dict[str, str] = {
+    # Canonical forms map to themselves so round-tripping is a no-op.
+    **{t.lower(): t for t in DOMAIN_ENTITY_TYPES},
+    "patient": "Patient",
+    # Surface forms observed from real LLM extraction runs, plus the obvious
+    # near-synonyms. `_CANDIDATE_FACT_SCHEMA` now pins `object_type` to an enum,
+    # so this table is the belt-and-braces for older checkpoints and the
+    # rule-based fallback path, not the primary defence.
+    "diagnosis": "Condition",
+    "disease": "Condition",
+    "finding": "Condition",
+    "drug": "Medication",
+    "med": "Medication",
+    "medicine": "Medication",
+    "medications": "Medication",
+    "allergen": "Allergy",
+    "sign": "Symptom",
+    "complaint": "Symptom",
+    "symptoms": "Symptom",
+    "surgery": "Procedure",
+    "operation": "Procedure",
+    "test": "Procedure",
+    "imaging": "Procedure",
+    "doctor": "Provider",
+    "physician": "Provider",
+    "clinician": "Provider",
+    "dose": "Dosage",
+}
+"""Lowercased free-text entity type -> canonical `DOMAIN_ENTITY_TYPES` member.
+
+Deliberately does NOT map `dosage -> Medication`. A dose string is its own
+entity: `"60mg"` and `"80mg"` are trigram-similar, and `resolve._similar` would
+merge them into one canonical node, collapsing exactly the dose-change history
+that `CURRENT_DOSAGE_OF` (one of only three `FUNCTIONAL_KEYS`, i.e. one of the
+three predicates that fire `SUPERSEDES`) exists to record."""
+
+
+def normalize_entity_type(raw: str | None) -> str | None:
+    """Canonicalize a free-text entity type onto `DOMAIN_ENTITY_TYPES`.
+
+    Returns `None` for anything unmappable — the caller decides whether that is
+    a drop or an error. Returning `None` rather than a `"Entity"` placeholder is
+    deliberate: `"Entity"` is not a graph label, so it would be accepted here and
+    then silently skipped much later by `graph/writer.py::_register_entity`,
+    which is the exact failure this function exists to prevent.
+    """
+    if not raw:
+        return None
+    return ENTITY_TYPE_ALIASES.get(raw.strip().lower())
+
+# ---------------------------------------------------------------------------
 # Patient-ish placeholder detection (2026-08-17 subject/object role-reversal
 # bug fix)
 # ---------------------------------------------------------------------------
@@ -182,6 +258,15 @@ class RetrieveResult:
     structural_absence: bool
     paths: list
     latency_ms: dict
+    """Per-stage wall-clock, keys: `search`, `total`, `graph`, `vector`,
+    `lexical`, `rerank`.
+
+    `rerank` added 2026-08-17 with the optional cross-encoder stage; it is
+    always present and is 0.0 when no reranker is configured (the default).
+    Reported as its own key rather than folded into `vector`/`lexical` because
+    the reranker's cost IS the measurement — the model in that stage is
+    targeted at CPU-only deployment, and a rerank latency hidden inside the
+    retrieval numbers is exactly the figure that decision needs."""
 
 
 # ---------------------------------------------------------------------------
