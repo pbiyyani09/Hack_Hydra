@@ -246,6 +246,11 @@ collaborative/
 /auth-token
 # Local data — fetched at setup, never vendored (decisions/001)
 data/
+# Deliberate exception, tracked via `git add -f`: the four int8 ONNX
+# reranker arms under data/reranker_ft/*-onnx/ (95 MB total). Model
+# weights, not corpus data; graph/reranker.py's -onnx-int8 registry
+# keys resolve to these paths, so they must survive a fresh clone.
+# See data/reranker_ft/README.md.
 *.pdf.bak
 # Untracked duplicate of the gitignored collaborative/ workspace
 # (collaborative/literature/*, collaborative/literature/GROK-INTAKE.md,
