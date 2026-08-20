@@ -223,6 +223,7 @@ FT_MEDLOCOMO_KEYS = (
     "ms-marco-minilm-l6-v2-ft-medlocomo-onnx-int8",
     "ms-marco-minilm-l6-v2-ft-orpo",
     "ms-marco-minilm-l6-v2-ft-orpo-onnx-int8",
+    "ms-marco-minilm-l6-v2-ft-orpo-turn",
     "ms-marco-minilm-l6-v2-ft-orpo-turn-onnx-int8",
     "ms-marco-minilm-l6-v2-ft-listwise",
     "ms-marco-minilm-l6-v2-ft-listwise-onnx-int8",

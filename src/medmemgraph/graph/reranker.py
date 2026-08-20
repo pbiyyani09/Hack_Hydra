@@ -485,6 +485,14 @@ REGISTERED_MODELS: dict[str, RerankerModelSpec] = {
         params=595_776_512,
         approx_ram_mb=2383.1,
     ),
+    "ms-marco-minilm-l6-v2-ft-orpo-turn": RerankerModelSpec(
+        key="ms-marco-minilm-l6-v2-ft-orpo-turn",
+        hf_id="data/reranker_ft/ms-marco-minilm-l6-v2-ft-orpo-turn",
+        kind="seq_classification",
+        params=22_714_113,
+        approx_ram_mb=90.9,
+        backend="torch",
+    ),
     "ms-marco-minilm-l6-v2-ft-orpo-turn-onnx-int8": RerankerModelSpec(
         key="ms-marco-minilm-l6-v2-ft-orpo-turn-onnx-int8",
         hf_id="data/reranker_ft/ms-marco-minilm-l6-v2-ft-orpo-turn-onnx",
