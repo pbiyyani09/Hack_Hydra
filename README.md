@@ -586,7 +586,15 @@ disk, so a re-run is close to free.
 ### Scale of the ingested graph
 
 20 patients: **13,406 facts written, 0 skipped**, 30,086 `:Turn` nodes, 4,271
-`SUPERSEDES` and 6,917 `CONTRADICTS` edges. On the contradiction rate, see the
+`SUPERSEDES` and 6,917 `CONTRADICTS` edges — the numbers from the reference
+ingest, which is what `scripts/ingest_corpus.py --limit 20` reproduces.
+
+The graph the results were measured against is a later replay of that ingest and
+holds **13,782 claims and 28,141 `:Turn` nodes**. The turn count is ~6% lower
+because a transient Bolt disconnect cut one patient's turn-writing after its
+claims had committed. Both numbers are stated rather than one being quietly
+picked: the claim layer is complete, the provenance layer is thin for that one
+patient. On the contradiction rate, see the
 measured note above `POSSIBLE_CONFIDENCE_FLOOR` in `graph/invalidate.py` — it is
 inflated by an interaction between two independently chosen constants, and is
 reported rather than tuned away.
