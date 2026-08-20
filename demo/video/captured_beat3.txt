@@ -1,0 +1,9 @@
+[6084478823090506016] CURRENT_DOSAGE_OF (invalidated, 2122-08-13T07:36:00 .. 2122-08-13T07:36:00)
+    turn 26605038/12: "It’s appropriate, but it can lower potassium. We’re adding more spironolactone—from 200 to 300 mg daily. It helps keep potassium up and removes fluid."
+    turn 26605038/35: "Same as before, but spironolactone is now 300 mg daily. Furosemide stays at 60 mg. Keep taking lactulose, rifaximin, and the others as prescribed."
+  --(no direct edge)-->
+[6587872413839679974] CURRENT_DOSAGE_OF (invalidated, 2122-08-28T23:36:00 .. 2122-09-03T16:29:15)
+    turn 23527958/7: "We think it’s related to your liver disease. Since your last admission, your spironolactone was increased to 300 mg. That can sometimes worsen nausea in patients with cirrhosis."
+  --CONTRADICTS-->
+[614261132365461680] CURRENT_DOSAGE_OF (active, ongoing)
+    turn 23939643/17: "Not long-term. We’ll restart them once you’re stable. But we may adjust the dose. Your spironolactone was 300 mg—quite high. We might reduce it to help with nausea."

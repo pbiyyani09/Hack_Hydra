@@ -1,0 +1,47 @@
+{
+  "voice": "en-US-AndrewNeural",
+  "beats": [
+    {
+      "id": "title",
+      "seconds": 12,
+      "say": "This is MedMemGraph: graph-native clinical memory for AI agents, built on HydraDB open source, running self-hosted with no managed API. A patient's history spans dozens of hospital admissions. We ingest that history into a property graph: thirteen thousand seven hundred clinical claims across twenty patients, each one linked back to the sentence a doctor actually said.",
+      "screen": "title",
+      "actual": 25.3
+    },
+    {
+      "id": "beat1",
+      "seconds": 42,
+      "say": "Beat one. A question that spans two admissions. Did the spironolactone dose change? One retrieve call. The router sends this to the graph because it crosses admissions, and you can see the route, a real path through the graph, and citations back to the exact turns. Five thousand tokens, where putting the whole history in the prompt costs eighty thousand.",
+      "screen": "beat1",
+      "actual": 22.5
+    },
+    {
+      "id": "beat2",
+      "seconds": 28,
+      "say": "Beat two. Now something that is not in this patient's record at all. Instead of returning the nearest-looking chunk, it says plainly that there is no mention of it. Knowing when the answer is absent is the thing long-context models are worst at, and it is the category where we beat full-context by the widest margin.",
+      "screen": "beat2",
+      "actual": 18.9
+    },
+    {
+      "id": "beat3",
+      "seconds": 48,
+      "say": "Beat three, and this is the part that is hard to do with a vector store. Show me how this fact changed, and why you believe each version. Three versions of one dose claim, across three admissions, connected by typed edges. Nothing was deleted. Each version quotes the sentence that produced it. That is a bounded path walk over a graph a stranger can audit, not a similarity score.",
+      "screen": "beat3",
+      "actual": 24.0
+    },
+    {
+      "id": "beat4",
+      "seconds": 30,
+      "say": "The numbers. Zero point seven eight three against full-context's zero point seven five seven, on the same three hundred and thirty-six questions, using eight times fewer tokens, and abstaining better. At this sample size the accuracy difference sits inside the noise, so we call it a match, not a win. The cost difference is not inside the noise.",
+      "screen": "beat4",
+      "actual": 22.1
+    },
+    {
+      "id": "close",
+      "seconds": 10,
+      "say": "MedMemGraph. Built on HydraDB open source, self-hosted. Code and full results on GitHub.",
+      "screen": "close",
+      "actual": 7.1
+    }
+  ]
+}

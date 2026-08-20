@@ -1,0 +1,16 @@
+MedMemGraph chat -- patient '10056223'. Ctrl-D or 'exit' to quit.
+> 
+answer: Yes, the spironolactone dose changed between admissions. Earlier admissions show doses such as 25 mg twice daily and two tablets once daily, while later admissions indicate an increased dose up to 300 mg daily, with consideration to reduce it due to side effects like nausea.
+route=hybrid  structural_absence=false
+path: Medication(furosemide) <-[ABOUT]- Claim[CURRENT_DOSAGE_OF asserted, active, 2120-10-11T12:10:00..ongoing, conf=1.00] (+35 more path(s))
+citations: 20971116 turns=[43, 42, 26, 34, 36, 49, 15, 45, 17, 32, 29, 32, 34, 20, 37]; 26605038 turns=[12]; 20971116 turns=[43, 42, 26, 34, 36, 49, 15, 45, 17, 32, 29, 33, 34, 20, 37]; 20643984 turns=[36]; 21531192 turns=[20, 30, 11]; 26605038 turns=[35]; 23939643 turns=[17]
+tokens: prompt=4793 completion=489 total=5282
+latency_ms: retrieve=50573.1  answer=10071.5
+> 
+answer: The evidence shows various medical issues including a head injury, subcutaneous air, chest X-ray, CT scan results, and pain symptoms, but there is no mention or indication that the patient has ever been treated for a scuba diving injury.
+route=hybrid  structural_absence=false
+path: Procedure(CT scan) <-[ABOUT]- Claim[HAD_PROCEDURE asserted, active, 2121-01-28T17:50:30..ongoing, conf=1.00] (+11 more path(s))
+citations: 23527958 turns=[2]; 20971116 turns=[34]; 21531192 turns=[5]; 20971116 turns=[34]; 29768917 turns=[8, 7]; 25634906 turns=[16, 30]; 23527958 turns=[53]
+tokens: prompt=1693 completion=341 total=2034
+latency_ms: retrieve=23520.3  answer=3700.3
+> 
