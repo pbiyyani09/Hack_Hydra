@@ -558,6 +558,30 @@ a known-false claim into the suite.
   convention; the two are cross-checked against each other in §8.6's own
   note, not asserted identical.
 
+## 8a. Finetuned MiniLM arms (eval-only, 2026-08-17)
+
+Two **new** registry keys, added after a patient-level gold+hardneg
+finetune on MedLoCoMo train patients (eval trio
+`10056223` / `10213338` / `10312715` held out):
+
+- `ms-marco-minilm-l6-v2-ft-medlocomo` — local torch checkpoint
+- `ms-marco-minilm-l6-v2-ft-medlocomo-onnx-int8` — locally exported
+  int8 ONNX (`onnx/model_qint8_avx512.onnx` under the export dir, **not**
+  the Hub-shipped un-finetuned graph)
+
+The original `ms-marco-minilm-l6-v2-onnx-int8` arm is unchanged. These
+keys are **eval-only**. This module is still **not imported by
+`retrieve.py`**. Wiring a CE arm into `retrieve()` / demo defaults is out
+until an explicit post-freeze go.
+
+A second student objective, **CE-ORPO** (`…-ft-orpo` / `…-ft-orpo-onnx-int8`),
+is the same MiniLM with L = −logσ(s_w) + λ −logσ(s_w−s_l) on
+(gold, other-admission hard-neg) triples. Best measured turn Hit@10 on
+the eval trio is **0.874** (unfinetuned 0.810, pointwise-BCE FT 0.866,
+GPU 0.900). The 0.88 bar was not met. Hit@2 / nDCG recovered vs BCE.
+Admission Hit@10 is still below the unfinetuned MiniLM. See
+`results/finetune-reranker/close_the_gap.md`.
+
 ## 9. Verification (this story)
 
 `uv run pytest tests/test_reranker.py -v` — 38 tests, all passing, ~25-27s

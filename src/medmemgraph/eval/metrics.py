@@ -828,24 +828,35 @@ def recall_at_k(retrieved: Sequence[_RetrievedLike], evidence: dict, k: int) -> 
 
 
 def ndcg_at_k(retrieved: Sequence[_RetrievedLike], evidence: dict, k: int) -> float:
-    """Normalized DCG@k with binary per-item relevance (turn-level match if
-    the QA item carries gold turn ids, else admission-level match — same
-    grounding rule as ``recall_at_k``). The ideal ranking places
-    ``min(k, n_gold_units)`` relevant items first, matching standard
-    practice for binary-relevance retrieval eval against a gold set (not
-    the full candidate pool's own relevance grades, which this project's
-    RetrieveResult doesn't carry).
+    """Normalized DCG@k. Always in ``[0, 1]``.
+
+    Binary per-item relevance, same ``_is_relevant`` rule as
+    ``recall_at_k`` (turn match if ``turn_ids`` exist, else admission
+    match). DCG uses the actual top-k order. IDCG is DCG of the ideal
+    order of the *same* relevance labels (Evidently / Järvelin &
+    Kekäläinen): all relevant items first.
+
+    ``n_gold`` (gold turn ids, or gold admissions when turns are absent)
+    is a lower bound on how many relevant items exist in the collection.
+    The scored list can contain *more* relevant items than that at
+    admission grain — every turn of a gold admission is rel=1, and the
+    index stores one unit per turn. IDCG therefore uses
+    ``min(k, max(n_gold, n_relevant_in_retrieved))``. Using only
+    ``n_gold`` here made admission nDCG exceed 1.0 (DCG summed many
+    relevant turns; IDCG allowed only 1–4). That was a bug, not a
+    legitimate score.
     """
     if k < 1:
         raise ValueError("k must be >= 1")
     gold = _parse_gold_evidence(evidence)
     n_gold = len(gold.turn_ids) if gold.turn_ids is not None else len(gold.admissions)
+    n_rel = sum(1 for item in retrieved if _is_relevant(item, gold))
     top_k = retrieved[:k]
 
     rels = [1.0 if _is_relevant(item, gold) else 0.0 for item in top_k]
     dcg = sum(r / math.log2(i + 2) for i, r in enumerate(rels))
 
-    ideal_count = min(k, n_gold)
+    ideal_count = min(k, max(n_gold, n_rel))
     idcg = sum(1.0 / math.log2(i + 2) for i in range(ideal_count))
     if idcg == 0.0:
         return 0.0

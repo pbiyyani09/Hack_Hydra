@@ -114,41 +114,19 @@ saturation for retrieval quality — the informative Recall@k rows are the
 low-k ones (10/20/50).
 
 --------------------------------------------------------------------------
-Admission-grain nDCG can legitimately exceed 1.0 — verified, not a bug
+Admission-grain nDCG > 1.0 was a bug (fixed). nDCG is in [0, 1].
 --------------------------------------------------------------------------
-Discovered by inspecting the real sweep's own numbers (several
-admission-grain nDCG cells came back > 1.0) and root-caused BEFORE being
-reported, per this project's "adversarial self-check" rule — reproduced
-directly against `eval/metrics.py::ndcg_at_k` with a hand-built minimal
-case (`m.ndcg_at_k([Item("adm-X",[1]), Item("adm-X",[2]), Item("adm-X",[3]),
-Item("adm-X",[4])], {"admissions": ["adm-X"]}, 10) == 2.56...`) before
-being surfaced here. The cause: `ndcg_at_k`'s own IDCG uses `ideal_count =
-min(k, n_gold_units)` (`eval/metrics.py`, pre-existing, not redefined by
-this module — story requirement: reuse it verbatim). At admission grain,
-`n_gold_units` is the number of DISTINCT gold admissions (often 1-4), but
-`PatientIndex` indexes one unit PER TURN, so a reranked top-k can contain
-several turns that all legitimately belong to that one gold admission —
-each individually admission-relevant (rel=1), summed into DCG, while IDCG
-stays capped at the 1-4-term ideal. The bound `nDCG<=1` assumes at most
-`n_gold_units` retrieved items can be relevant; that assumption holds at
-turn grain (this project's index has exactly one unit per turn, so at most
-one retrieved item can carry any given gold turn id — confirmed empirically
-in the real sweep: every turn-grain nDCG cell in this story's results
-stayed within [0,1]) but does NOT hold at admission grain whenever more
-than `n_gold_units` distinct turns from the correct admission(s) are
-retrieved, which is common and not a failure mode — finding many turns from
-the right admission is what a good retriever is SUPPOSED to do.
-
-Practical reading: `Hit@k` and `Recall@k` are bounded and directly
-comparable at both grains, always. `nDCG@k` at TURN grain is the standard,
-bounded-in-[0,1] ranking-quality signal. `nDCG@k` at ADMISSION grain is
-still a valid RELATIVE (higher-is-better, same-scale-across-configs)
-ranking-quality signal — every config in a given sweep is scored by the
-exact same `ndcg_at_k` definition against the exact same gold, so
-config-vs-config comparisons remain fair — but it is not a `[0,1]`-bounded
-proportion and must never be read or reported as one. `render_markdown`
-prints `NDCG_ADMISSION_CAVEAT` verbatim beside every admission-grain nDCG
-column for exactly this reason.
+DCG marked every retrieved *turn* of a gold admission as rel=1. IDCG
+used `min(k, n_gold_admissions)` — often 1. Four gold-admission turns
+in the list produced nDCG@10 ≈ 2.56. That violates the definition
+(Evidently, Järvelin & Kekäläinen): NDCG = DCG / IDCG of the *same*
+relevance labels, so the value lives in [0, 1]. `metrics.ndcg_at_k`
+now sets IDCG from `max(n_gold_units, n_relevant_in_the_scored_list)`.
+On-disk admission nDCG in older `results/retrieval_eval__admission__*`
+/ `cpu_ablation_*` files was computed with the broken IDCG — do not
+compare those cells to a post-fix sweep. Turn-grain nDCG was already
+in [0, 1] (one index unit per gold turn). `NDCG_ADMISSION_CAVEAT` now
+states the bound, not the old "legitimately > 1" claim.
 """
 
 from __future__ import annotations
@@ -158,7 +136,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 
@@ -221,14 +199,13 @@ RECALL_CEILING_NOTE = (
 )
 
 NDCG_ADMISSION_CAVEAT = (
-    "nDCG@k at admission grain can legitimately exceed 1.0: eval/metrics.py's "
-    "ndcg_at_k caps IDCG at min(k, n_gold_admissions), but multiple distinct "
-    "turns from one correct admission can all be individually relevant, "
-    "inflating DCG past that cap (verified directly against eval/metrics.py "
-    "with a hand-built case, see retrieval_eval.py module docstring). Read "
-    "these values as a relative, same-scale-across-configs ranking signal, "
-    "never as a bounded [0,1] proportion. nDCG@k at TURN grain does not have "
-    "this property (one indexed unit per turn) and stays in [0,1]."
+    "nDCG@k is DCG/IDCG and is in [0, 1] at both grains. A previous IDCG "
+    "that used only n_gold_admissions (while DCG counted every gold-admission "
+    "turn as relevant) made admission nDCG exceed 1.0; that was a bug. IDCG "
+    "now uses the same _is_relevant labels as DCG. Older on-disk admission "
+    "nDCG columns (cpu_ablation, retrieval_eval__admission__ before this "
+    "fix) are not comparable to a post-fix sweep. Turn-grain nDCG was "
+    "already in [0, 1]."
 )
 
 
@@ -645,6 +622,128 @@ def _phi_correlation(mc: "metrics.McNemarResult") -> float:
     denom = math.sqrt(max((a + b) * (c + d) * (a + c) * (b + d), 1))
     corr = ((a * d - b * c) / denom) if denom else 0.0
     return max(-1.0, min(1.0, corr))
+
+
+def _item_as_mapping(item: ItemMetrics | Mapping[str, Any]) -> Mapping[str, Any]:
+    if isinstance(item, Mapping):
+        return item
+    return {
+        "patient_id": item.patient_id,
+        "qa_id": item.qa_id,
+        "hit_admission": item.hit_admission,
+        "hit_turn": item.hit_turn,
+        "ndcg_admission": item.ndcg_admission,
+        "ndcg_turn": item.ndcg_turn,
+    }
+
+
+def _metric_at(field: Mapping[Any, Any] | None, k: int) -> float | None:
+    if field is None:
+        return None
+    if k in field:
+        return float(field[k])
+    key = str(k)
+    if key in field:
+        return float(field[key])
+    return None
+
+
+def paired_configs(
+    items_a: Sequence[ItemMetrics] | Sequence[Mapping[str, Any]],
+    items_b: Sequence[ItemMetrics] | Sequence[Mapping[str, Any]],
+    *,
+    grain: Literal["admission", "turn"],
+    k: int = 10,
+    alpha: float = 0.05,
+) -> dict[str, Any]:
+    """Join on ``(patient_id, qa_id)``. ``grain=turn`` drops ``hit_turn is None``.
+
+    ``hit_delta`` is b − a. Missing turn-grain rows are never zero-filled.
+    """
+    if grain not in {"admission", "turn"}:
+        raise ValueError(f"grain must be admission|turn, got {grain!r}")
+
+    def index(items: Sequence[ItemMetrics] | Sequence[Mapping[str, Any]]) -> dict[tuple[str, str], Mapping[str, Any]]:
+        out: dict[tuple[str, str], Mapping[str, Any]] = {}
+        for raw in items:
+            item = _item_as_mapping(raw)
+            out[(str(item["patient_id"]), str(item["qa_id"]))] = item
+        return out
+
+    by_a = index(items_a)
+    by_b = index(items_b)
+    hit_field = "hit_admission" if grain == "admission" else "hit_turn"
+    ndcg_field = "ndcg_admission" if grain == "admission" else "ndcg_turn"
+
+    a_correct: list[bool] = []
+    b_correct: list[bool] = []
+    a_ndcg: list[float] = []
+    b_ndcg: list[float] = []
+    for key in sorted(set(by_a) & set(by_b)):
+        ia, ib = by_a[key], by_b[key]
+        ha = _metric_at(ia.get(hit_field), k)
+        hb = _metric_at(ib.get(hit_field), k)
+        if ha is None or hb is None:
+            continue
+        a_correct.append(bool(ha))
+        b_correct.append(bool(hb))
+        na = _metric_at(ia.get(ndcg_field), k)
+        nb = _metric_at(ib.get(ndcg_field), k)
+        if na is not None and nb is not None:
+            a_ndcg.append(na)
+            b_ndcg.append(nb)
+
+    n = len(a_correct)
+    if n == 0:
+        return {
+            "n_paired": 0,
+            "hit_delta": float("nan"),
+            "hit_p_raw": float("nan"),
+            "hit_p_holm": float("nan"),
+            "reject_holm": False,
+            "ndcg_delta": float("nan"),
+            "ndcg_p": float("nan"),
+            "paired_mde_pp": None,
+            "underpowered": True,
+            "phi": 0.0,
+        }
+
+    mc = metrics.mcnemar_test(a_correct, b_correct)
+    holm = metrics.holm_bonferroni([mc.p_value], alpha=alpha)
+    hit_delta = (sum(b_correct) - sum(a_correct)) / n
+    phi = _phi_correlation(mc)
+    paired_mde_pp = None
+    baseline_acc = (sum(a_correct) + sum(b_correct)) / (2 * n)
+    if 0.0 < baseline_acc < 1.0:
+        try:
+            paired_mde_pp = metrics.mde(mc.n, baseline_acc, phi).mde_pp
+        except ValueError:
+            paired_mde_pp = None
+    if a_ndcg and len(a_ndcg) == len(b_ndcg):
+        pb = metrics.paired_bootstrap_test(
+            np.array(b_ndcg), np.array(a_ndcg), n_resamples=2000, seed=0
+        )
+        ndcg_delta = pb.observed_diff
+        ndcg_p = pb.p_value
+    else:
+        ndcg_delta = float("nan")
+        ndcg_p = float("nan")
+    underpowered = paired_mde_pp is not None and abs(hit_delta) < paired_mde_pp
+    return {
+        "n_paired": n,
+        "hit_delta": hit_delta,
+        "hit_p_raw": mc.p_value,
+        "hit_p_holm": holm.adjusted_p[0],
+        "reject_holm": holm.reject[0],
+        "ndcg_delta": ndcg_delta,
+        "ndcg_p": ndcg_p,
+        "paired_mde_pp": paired_mde_pp,
+        "underpowered": underpowered,
+        "phi": phi,
+        "a_hit": sum(a_correct) / n,
+        "b_hit": sum(b_correct) / n,
+        "mc": mc,
+    }
 
 
 def paired_reranker_vs_noop(

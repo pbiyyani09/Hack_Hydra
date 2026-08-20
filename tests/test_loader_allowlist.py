@@ -316,3 +316,34 @@ def test_load_qa_shape_matches_contract():
 def test_missing_patient_raises_loader_error(tmp_path: Path):
     with pytest.raises(LoaderError):
         load_conversation("NO_SUCH_PATIENT", root=tmp_path)
+
+
+def test_pair_builder_on_one_train_patient_opens_only_allowlisted(tmp_path: Path):
+    """FT-E1-S2: pair builder corpus reads stay on the two allowlisted names."""
+    from medmemgraph.eval.rerank_pairs import build_pairs
+    from medmemgraph.eval.rerank_split import EVAL_TRIO
+
+    train_id = next(s for s in _real_subject_ids() if s not in EVAL_TRIO)
+
+    class _EmptyIndex:
+        def build(self, conversation, facts=None) -> None:
+            del conversation, facts
+
+        def search(self, query: str, k: int):
+            del query, k
+            return []
+
+    split = {"eval": list(EVAL_TRIO), "dev": [], "train": [train_id]}
+    with OpenGuard() as guard:
+        build_pairs(
+            split,
+            out_dir=tmp_path,
+            index_factory=lambda sid: _EmptyIndex(),
+            only_subjects=[train_id],
+        )
+    opened = guard.filenames()
+    _assert_no_disqualified_names(opened)
+    corpus_names = {p.name for p in guard.opened if "MedLoCoMo" in p.parts}
+    assert corpus_names <= {ALLOWED_INGEST_FILENAME, ALLOWED_EVAL_FILENAME}
+    assert ALLOWED_INGEST_FILENAME in corpus_names
+    assert ALLOWED_EVAL_FILENAME in corpus_names

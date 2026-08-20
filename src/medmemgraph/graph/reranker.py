@@ -420,6 +420,80 @@ REGISTERED_MODELS: dict[str, RerankerModelSpec] = {
         params=4_386_561,
         approx_ram_mb=17.5,
     ),
+    # Finetuned MiniLM (FT-E2-S2). Additive keys. The original
+    # ms-marco-minilm-l6-v2-onnx-int8 arm is untouched. Eval-only —
+    # retrieve.py does not import this module.
+    "ms-marco-minilm-l6-v2-ft-medlocomo": RerankerModelSpec(
+        key="ms-marco-minilm-l6-v2-ft-medlocomo",
+        hf_id="data/reranker_ft/ms-marco-minilm-l6-v2-ft-medlocomo",
+        kind="seq_classification",
+        params=22_714_113,
+        approx_ram_mb=90.9,
+        backend="torch",
+    ),
+    "ms-marco-minilm-l6-v2-ft-medlocomo-onnx-int8": RerankerModelSpec(
+        key="ms-marco-minilm-l6-v2-ft-medlocomo-onnx-int8",
+        hf_id="data/reranker_ft/ms-marco-minilm-l6-v2-ft-medlocomo-onnx",
+        kind="seq_classification",
+        params=22_714_113,
+        approx_ram_mb=22.7,
+        backend="onnx",
+        onnx_file="onnx/model_qint8_avx512.onnx",
+    ),
+    "ms-marco-minilm-l6-v2-ft-orpo": RerankerModelSpec(
+        key="ms-marco-minilm-l6-v2-ft-orpo",
+        hf_id="data/reranker_ft/ms-marco-minilm-l6-v2-ft-orpo",
+        kind="seq_classification",
+        params=22_714_113,
+        approx_ram_mb=90.9,
+        backend="torch",
+    ),
+    "ms-marco-minilm-l6-v2-ft-orpo-onnx-int8": RerankerModelSpec(
+        key="ms-marco-minilm-l6-v2-ft-orpo-onnx-int8",
+        hf_id="data/reranker_ft/ms-marco-minilm-l6-v2-ft-orpo-onnx",
+        kind="seq_classification",
+        params=22_714_113,
+        approx_ram_mb=22.7,
+        backend="onnx",
+        onnx_file="onnx/model_qint8_avx512.onnx",
+    ),
+    "ms-marco-minilm-l6-v2-ft-listwise": RerankerModelSpec(
+        key="ms-marco-minilm-l6-v2-ft-listwise",
+        hf_id="data/reranker_ft/ms-marco-minilm-l6-v2-ft-listwise",
+        kind="seq_classification",
+        params=22_714_113,
+        approx_ram_mb=90.9,
+        backend="torch",
+    ),
+    "ms-marco-minilm-l6-v2-ft-listwise-onnx-int8": RerankerModelSpec(
+        key="ms-marco-minilm-l6-v2-ft-listwise-onnx-int8",
+        hf_id="data/reranker_ft/ms-marco-minilm-l6-v2-ft-listwise-onnx",
+        kind="seq_classification",
+        params=22_714_113,
+        approx_ram_mb=22.7,
+        backend="onnx",
+        onnx_file="onnx/model_qint8_avx512.onnx",
+    ),
+    "qwen3-rerank-0.6b-ft-listwise": RerankerModelSpec(
+        key="qwen3-rerank-0.6b-ft-listwise",
+        hf_id="data/reranker_ft/qwen3-rerank-0.6b-ft-listwise",
+        kind="causal_yesno",
+        instruction=(
+            "Given a clinical conversation search query, retrieve the passage "
+            "that most directly answers the query"
+        ),
+        params=595_776_512,
+        approx_ram_mb=2383.1,
+    ),
+    "ms-marco-minilm-l6-v2-ft-orpo-turn-onnx-int8": RerankerModelSpec(
+        key="ms-marco-minilm-l6-v2-ft-orpo-turn-onnx-int8",
+        hf_id="data/reranker_ft/ms-marco-minilm-l6-v2-ft-orpo-turn-onnx",
+        kind="seq_classification",
+        params=22_714_113,
+        approx_ram_mb=22.7,
+        backend="onnx",
+        onnx_file="onnx/model_qint8_avx512.onnx",
+    ),
 }
 """Every `hf_id` above independently verified reachable on the Hub
 (`huggingface_hub.model_info`, run directly in this sandbox before this

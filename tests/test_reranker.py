@@ -218,11 +218,24 @@ covered by their own `Test*Real` classes above) and `noop` (not in
 `REGISTERED_MODELS` at all — `NoopReranker` is a standalone class)."""
 
 
+FT_MEDLOCOMO_KEYS = (
+    "ms-marco-minilm-l6-v2-ft-medlocomo",
+    "ms-marco-minilm-l6-v2-ft-medlocomo-onnx-int8",
+    "ms-marco-minilm-l6-v2-ft-orpo",
+    "ms-marco-minilm-l6-v2-ft-orpo-onnx-int8",
+    "ms-marco-minilm-l6-v2-ft-orpo-turn-onnx-int8",
+    "ms-marco-minilm-l6-v2-ft-listwise",
+    "ms-marco-minilm-l6-v2-ft-listwise-onnx-int8",
+    "qwen3-rerank-0.6b-ft-listwise",
+)
+
+
 def test_registered_models_shape():
     assert set(REGISTERED_MODELS) == {
         "qwen3-rerank-0.6b",
         "bge-rerank-v2-m3",
         *CPU_ABLATION_MODEL_KEYS,
+        *FT_MEDLOCOMO_KEYS,
     }
     assert REGISTERED_MODELS["qwen3-rerank-0.6b"].kind == "causal_yesno"
     assert REGISTERED_MODELS["bge-rerank-v2-m3"].kind == "seq_classification"
@@ -292,6 +305,35 @@ def test_onnx_int8_arm_is_registered_and_smaller_than_its_torch_sibling():
     assert onnx_spec.hf_id == torch_spec.hf_id
     assert onnx_spec.params == torch_spec.params
     assert onnx_spec.approx_ram_mb < torch_spec.approx_ram_mb / 2  # int8 vs fp32
+
+
+def test_old_onnx_int8_spec_untouched():
+    spec = REGISTERED_MODELS["ms-marco-minilm-l6-v2-onnx-int8"]
+    assert spec.hf_id == "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    assert spec.backend == "onnx"
+    assert spec.onnx_file == "onnx/model_qint8_avx512.onnx"
+    assert spec.params == 22_714_113
+
+
+def test_ft_medlocomo_torch_key_is_local_and_lazy():
+    spec = REGISTERED_MODELS["ms-marco-minilm-l6-v2-ft-medlocomo"]
+    assert spec.backend == "torch"
+    assert spec.hf_id == "data/reranker_ft/ms-marco-minilm-l6-v2-ft-medlocomo"
+    assert spec.params == 22_714_113
+    rer = CrossEncoderReranker("ms-marco-minilm-l6-v2-ft-medlocomo")
+    assert rer.spec.key == spec.key
+    assert rer._backend is None  # lazy; construction must not load weights
+
+
+def test_ft_medlocomo_onnx_key_points_at_local_export_not_hub():
+    spec = REGISTERED_MODELS["ms-marco-minilm-l6-v2-ft-medlocomo-onnx-int8"]
+    assert spec.backend == "onnx"
+    assert spec.onnx_file == "onnx/model_qint8_avx512.onnx"
+    assert spec.hf_id == "data/reranker_ft/ms-marco-minilm-l6-v2-ft-medlocomo-onnx"
+    assert spec.hf_id != "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    assert spec.approx_ram_mb < 30
+    rer = CrossEncoderReranker(spec.key)
+    assert rer._backend is None
 
 
 def test_cross_encoder_reranker_lazy_construction_costs_nothing():

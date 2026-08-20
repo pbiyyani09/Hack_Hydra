@@ -444,6 +444,27 @@ def test_ndcg_at_k_no_relevant_items_is_zero():
     assert m.ndcg_at_k(retrieved, evidence, k=1) == pytest.approx(0.0, abs=1e-9)
 
 
+def test_ndcg_at_k_never_exceeds_one_when_many_admission_turns_are_relevant():
+    evidence = {"admissions": ["adm-1"]}
+    retrieved = [_Item(session_id="adm-1", turn_ids=[i]) for i in range(1, 11)]
+    score = m.ndcg_at_k(retrieved, evidence, k=10)
+    assert score == pytest.approx(1.0, abs=1e-9)
+
+
+def test_ndcg_at_k_admission_partial_list_stays_in_unit_interval():
+    evidence = {"admissions": ["adm-1"]}
+    retrieved = [
+        _Item(session_id="adm-9", turn_ids=[1]),
+        _Item(session_id="adm-1", turn_ids=[2]),
+        _Item(session_id="adm-1", turn_ids=[3]),
+    ]
+    score = m.ndcg_at_k(retrieved, evidence, k=3)
+    dcg = 0 / math.log2(2) + 1 / math.log2(3) + 1 / math.log2(4)
+    idcg = 1 / math.log2(2) + 1 / math.log2(3)
+    assert score == pytest.approx(dcg / idcg, abs=1e-9)
+    assert 0.0 < score <= 1.0
+
+
 def test_recall_and_ndcg_no_turn_ids_key_e7s2_ac2():
     # E7-S2 AC2: fixture item with no turn_ids key -> admission-level
     # Recall/NDCG are computed (not zero-filled, not raising) using the

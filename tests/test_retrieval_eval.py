@@ -364,6 +364,54 @@ def test_paired_reranker_vs_noop_no_noop_baseline_returns_empty():
     assert re.paired_reranker_vs_noop(sweep, k=10) == {}
 
 
+def _pair_item(pid: str, qid: str, hit_adm: float, hit_turn: float | None, ndcg_adm: float = 0.5, ndcg_turn: float | None = 0.5) -> re.ItemMetrics:
+    turn = None if hit_turn is None else {k: hit_turn for k in re.RERANK_KS}
+    ndcg_t = None if ndcg_turn is None else {k: ndcg_turn for k in re.RERANK_KS}
+    return re.ItemMetrics(
+        patient_id=pid, qa_id=qid, embedder="e", reranker="r", n_candidates=10,
+        retrieve_latency_ms=1.0, rerank_latency_ms=1.0,
+        recall_admission={k: 1.0 for k in re.RECALL_KS}, recall_turn=None,
+        hit_admission={k: hit_adm for k in re.RERANK_KS}, hit_turn=turn,
+        ndcg_admission={k: ndcg_adm for k in re.RERANK_KS}, ndcg_turn=ndcg_t,
+    )
+
+
+def test_paired_configs_turn_grain_drops_missing_hit_turn():
+    a = [
+        _pair_item("p1", "q1", 1.0, 1.0),
+        _pair_item("p1", "q2", 1.0, None),
+        _pair_item("p2", "q3", 0.0, 0.0),
+    ]
+    b = [
+        _pair_item("p1", "q1", 1.0, 0.0),
+        _pair_item("p1", "q2", 1.0, 1.0),
+        _pair_item("p2", "q3", 0.0, 1.0),
+    ]
+    out = re.paired_configs(a, b, grain="turn", k=10)
+    assert out["n_paired"] == 2
+    assert out["hit_delta"] == pytest.approx(0.0, abs=1e-9)  # (0,1) vs (1,0)
+
+
+def test_paired_configs_vs_non_noop_baseline_on_dicts():
+    gpu = [
+        {"patient_id": "p", "qa_id": "q0", "hit_admission": {"10": 1.0}, "hit_turn": {"10": 1.0},
+         "ndcg_admission": {"10": 0.9}, "ndcg_turn": {"10": 0.9}},
+        {"patient_id": "p", "qa_id": "q1", "hit_admission": {"10": 1.0}, "hit_turn": {"10": 1.0},
+         "ndcg_admission": {"10": 0.9}, "ndcg_turn": {"10": 0.9}},
+    ]
+    cpu = [
+        {"patient_id": "p", "qa_id": "q0", "hit_admission": {"10": 0.0}, "hit_turn": {"10": 0.0},
+         "ndcg_admission": {"10": 0.1}, "ndcg_turn": {"10": 0.1}},
+        {"patient_id": "p", "qa_id": "q1", "hit_admission": {"10": 0.0}, "hit_turn": {"10": 0.0},
+         "ndcg_admission": {"10": 0.1}, "ndcg_turn": {"10": 0.1}},
+    ]
+    out = re.paired_configs(gpu, cpu, grain="turn", k=10)
+    assert out["n_paired"] == 2
+    assert out["hit_delta"] == pytest.approx(-1.0, abs=1e-9)
+    assert out["a_hit"] == pytest.approx(1.0)
+    assert out["b_hit"] == pytest.approx(0.0)
+
+
 # ---------------------------------------------------------------------------
 # Rendering — shape/smoke checks (real numbers come from the actual sweep,
 # not this test file).
@@ -392,18 +440,15 @@ def test_render_markdown_turn_grain_omits_ceiling_note():
 
 
 def test_render_markdown_admission_grain_includes_ndcg_caveat():
-    """Verified-real caveat (see module docstring): admission-grain nDCG
-    can legitimately exceed 1.0 because eval/metrics.py::ndcg_at_k caps
-    IDCG at the gold-admission count while multiple retrieved turns can
-    all be individually admission-relevant."""
     text = re.render_markdown(_tiny_sweep(), grain="admission")
     assert re.NDCG_ADMISSION_CAVEAT in text
+    assert "[0, 1]" in re.NDCG_ADMISSION_CAVEAT
 
 
-def test_ndcg_at_k_can_exceed_one_at_admission_grain_hand_verified():
-    """Reproduces the exact real-sweep finding directly against
-    eval/metrics.py::ndcg_at_k -- root-caused before being reported, not
-    reported as an unexplained anomaly."""
+def test_ndcg_at_k_admission_many_turns_is_at_most_one():
+    """Four turns of one gold admission used to score nDCG@10 ≈ 2.56
+    because IDCG used n_gold_admissions=1. That is a bug. Same labels
+    on both sides → perfect ranking of those four items is 1.0."""
     class _I:
         def __init__(self, session_id, turn_ids):
             self.session_id = session_id
@@ -411,7 +456,9 @@ def test_ndcg_at_k_can_exceed_one_at_admission_grain_hand_verified():
 
     evidence = {"admissions": ["adm-X"]}
     retrieved = [_I("adm-X", [1]), _I("adm-X", [2]), _I("adm-X", [3]), _I("adm-X", [4])]
-    assert metrics.ndcg_at_k(retrieved, evidence, 10) == pytest.approx(2.5616063116448506, abs=1e-9)
+    score = metrics.ndcg_at_k(retrieved, evidence, 10)
+    assert score == pytest.approx(1.0, abs=1e-9)
+    assert 0.0 <= score <= 1.0
 
 
 def test_render_markdown_rejects_unknown_grain():
