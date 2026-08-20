@@ -1,0 +1,14 @@
+$ uv run python -m medmemgraph.eval.report
+
+  10 patients / 336 paired items / same judge
+
+  system                          answerable  abstention    tokens
+  ------------------------------ ----------- ----------- ---------
+  MedMemGraph  (graph + rerank)        0.783       0.583     9,703
+  Full-context (whole history)         0.757       0.517    80,557
+  Lexical BM25                         0.558       0.633     2,690
+  No-memory (sanity floor)             0.101       0.917       162
+
+  paired McNemar vs full-context:  p = 0.20  (not significant)
+  -> matches full-context accuracy at 8.3x fewer tokens,
+     and abstains better.

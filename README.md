@@ -55,7 +55,7 @@ us](#what-hydradb-oss-does-not-give-us).
 bash scripts/run_hydradb.sh                                     # boot HydraDB OSS, wait on :9090/readyz
 bash scripts/download_medlocomo.sh                              # fetch MedLoCoMo into data/ (gitignored, never vendored)
 uv sync --extra dev && uv run pytest -q -m "not live"            # install + offline tests
-uv run python scripts/ingest_corpus.py --limit 3                 # extract -> resolve -> write the graph
+uv run python scripts/ingest_corpus.py --limit 1                 # ~9 min, ~$0.15 — enough to try it
 uv run python -m medmemgraph.demo.agent --patient <patient_id>   # chat with one patient's memory
 ```
 
@@ -63,11 +63,16 @@ uv run python -m medmemgraph.demo.agent --patient <patient_id>   # chat with one
 `data/medlocomo/MedLoCoMo/` after the fetch step (101 of them; see
 [Data](#data)).
 
+**To just try it, one patient is enough** — `--limit 1`, about 9 minutes. The full
+20-patient corpus (2.9 hours) is only needed to reproduce the results tables.
+
 **The ingest step is not optional.** Every graph-route answer, the
 `structural_absence` abstention signal, and the provenance walk read state that
 only `scripts/ingest_corpus.py` writes; against an empty graph `retrieve()`
 degrades to the text arm and the demo silently has no paths to show. Ingest
-costs about **$0.15 and 3-12 minutes per patient** (one LLM call per admission);
+costs about **$0.15 and 9 minutes for one patient** (measured median over 20; range 2-23 min,
+driven by admission count — these patients have a median of 28 admissions and one
+LLM extraction call is made per admission);
 `llm.py` caches every completion to disk, so a re-run after a restart is
 essentially free.
 
@@ -256,7 +261,7 @@ Per patient: load the conversation, extract clinical facts (one LLM call per
 admission), resolve entities against everything ingested so far, write
 `:Claim` nodes with `SUPERSEDES`/`CONTRADICTS` edges, write the `:Turn`
 provenance layer, and save the dense + lexical indexes. Roughly **$0.15 and
-3-12 minutes per patient**; `id_map`/`registry` are persisted after every
+9 minutes for one patient** (median of 20; 2.9 h for all twenty). `id_map`/`registry` are persisted after every
 patient, so a crash at patient 17 does not discard the entity resolution done
 for 1-16, and a re-run replays from the LLM cache at ~$0.
 
@@ -558,7 +563,7 @@ architecture section implies.
 ```bash
 bash scripts/run_hydradb.sh
 bash scripts/download_medlocomo.sh
-uv run python scripts/ingest_corpus.py --limit 20         # ~$2.75, ~4h
+uv run python scripts/ingest_corpus.py --limit 20         # ~$2.75, ~2.9h (or --limit 1, ~9 min)
 
 export MEDMEMGRAPH_RERANKER=qwen3-rerank-0.6b             # +10.5 pts, p=0.00016
 export MEDMEMGRAPH_RERANKER_DEVICE=cuda                   # 'cpu' works; see the CPU column above
@@ -581,7 +586,15 @@ disk, so a re-run is close to free.
 ### Scale of the ingested graph
 
 20 patients: **13,406 facts written, 0 skipped**, 30,086 `:Turn` nodes, 4,271
-`SUPERSEDES` and 6,917 `CONTRADICTS` edges. On the contradiction rate, see the
+`SUPERSEDES` and 6,917 `CONTRADICTS` edges — the numbers from the reference
+ingest, which is what `scripts/ingest_corpus.py --limit 20` reproduces.
+
+The graph the results were measured against is a later replay of that ingest and
+holds **13,782 claims and 28,141 `:Turn` nodes**. The turn count is ~6% lower
+because a transient Bolt disconnect cut one patient's turn-writing after its
+claims had committed. Both numbers are stated rather than one being quietly
+picked: the claim layer is complete, the provenance layer is thin for that one
+patient. On the contradiction rate, see the
 measured note above `POSSIBLE_CONFIDENCE_FLOOR` in `graph/invalidate.py` — it is
 inflated by an interaction between two independently chosen constants, and is
 reported rather than tuned away.
