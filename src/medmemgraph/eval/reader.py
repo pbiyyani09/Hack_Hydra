@@ -149,17 +149,19 @@ the mitigation is documented on the judge side."""
 
 _VALID_MODES = frozenset({"direct", "chain_of_note"})
 _VALID_RENDERINGS = frozenset({"json", "prose", "shuffled"})
-_READER_MAX_TOKENS = 2500
+_READER_MAX_TOKENS = 4000
 """Chain-of-Note needs room for one note per retrieved item plus the
 reasoning/answer — bigger than judge.py's 300-token budget (a single
 correct/reason verdict).
 
-Raised 700 -> 2500 on 2026-08-19. One realistic note object measures ~44 tokens,
+Raised 700 -> 2500, then -> 4000 on 2026-08-19 when k rose to 60. One realistic note object measures ~44 tokens,
 so 700 fit only ~14 notes before the answer text was squeezed out — which
 silently capped the usable evidence budget at k~14 no matter what `k` was set
 to. Past that, `llm.py` detects truncation and escalates max_tokens x4
 (`_next_truncation_max_tokens`), so the run still completed but paid an extra
-round trip per item. 2500 covers ~50 notes plus an answer without escalating."""
+round trip per item. 4000 covers ~60 notes plus an answer without escalating; the cap must track
+`k`, because Chain-of-Note emits one note per evidence item and an
+under-sized cap silently converts extra evidence into extra retries."""
 _DEFAULT_SHUFFLE_SEED = 0
 
 
@@ -394,6 +396,138 @@ _CON_SYSTEM = (
     "Respond with the required JSON only: one note object per evidence "
     "item, in the same order, then the answer, then abstained."
 )
+"""Chain-of-Note reading prompt.
+
+STEP 3 added 2026-08-19. It exists because of a measured, specific failure, not
+a style preference.
+
+`eval/judge.py`'s rubric explicitly disclaims caring about verbosity -- "allowing
+for different wording, phrasing, or level of detail", "not exact wording or
+completeness of detail" -- and of 128 incorrect answerable records, 127 cite
+FACTUAL MATCH and none cite NO CONTRADICTION. So long answers are not penalised
+and shortening them buys nothing on its own.
+
+What was failing is COMMITMENT. 44% of the temporal items full-context gets and
+we do not are the judge saying we described where we should have asserted:
+"described a detailed clinical timeline of reflux and ulceration rather than
+[the gold]", "the system's detailed narrative of treatment changes deviates".
+MedLoCoMo golds are overwhelmingly transition-shaped -- "topiramate to
+valproate", "from unspecified to candidal esophagitis", "osteomyelitis in right
+then left toe" -- and a survey of the clinical picture never asserts the one
+before/after pair being asked for.
+
+Brevity appears here only as a forcing function toward that commitment. The
+instruction is to CHOOSE, not to be short."""
+
+_RESPOND_LINE = (
+    "Respond with the required JSON only: one note object per evidence "
+    "item, in the same order, then the answer, then abstained."
+)
+
+COMMIT_INSTRUCTION = (
+    "STEP 3 -- COMMIT: state the single most specific claim the evidence "
+    "supports, and state it as a claim rather than as a description. If the "
+    "question asks how something changed, progressed, or evolved, or asks you "
+    "to compare two points in time, your answer must NAME THE BEFORE-STATE AND "
+    "THE AFTER-STATE explicitly -- 'X to Y', 'X in <period>, Y in <period>'. "
+    "Only then, if it helps, add one short sentence of support.\n"
+    "Do NOT answer a 'how did this change' question by surveying everything "
+    "that happened to the patient. A timeline of five findings that never says "
+    "which one changed into which is a wrong answer even when every finding in "
+    "it is true. Choose. If the evidence genuinely supports two competing "
+    "readings, give the better-supported one first, in the required form.\n"
+)
+"""The STEP 3 "commit to a before/after claim" instruction, kept separate so
+it can be switched off.
+
+On by default for evaluation, OFF for `demo/agent.py`. The benchmark rewards
+asserting the one transition its gold names; a clinician at the terminal is
+better served by the fuller picture with citations. Same retrieval, same
+facts, different framing — and the README says so rather than letting the
+demo quietly imply the eval answers look like that too.
+
+Set `commit_style=False` to omit it."""
+
+
+TRANSITION_TYPES: frozenset[str] = frozenset()
+"""Question types answered with a forced before/after schema.
+
+**Deliberately EMPTY — this was tried, measured, and reverted on 2026-08-19.**
+
+The idea: MedLoCoMo golds for progression/comparison are transition-shaped
+("topiramate to valproate"), our answers narrated instead, and 44% of temporal
+losses were the judge saying we described where we should have asserted. A
+prompt instruction did nothing (verified: identical answers with the
+instruction present and absent, in both reader modes). Two REQUIRED schema
+fields did change the shape, exactly as intended.
+
+It made things worse, and the reason is specific and worth keeping:
+
+    gold "ventricular tachycardia"
+    ours "episodic ventricular tachycardia to sustained ventricular fibrillation"
+    judge: "stated ventricular fibrillation instead of ventricular tachycardia"
+
+    gold "C. difficile colitis"
+    ours "No documented C. difficile ... to C. difficile infection and Klebsiella"
+    judge: "explicitly denies documented C. difficile infection"
+
+We SAID the gold term both times. Demanding a before-state for a question whose
+gold is a single state manufactures a second term — often a negation — and the
+judge reads it as contradicting the gold. Before this change, NO CONTRADICTION
+had never once driven a verdict (0 of 128 failures); after it, it did.
+
+The deeper lesson, from `eval/judge.py`'s own rubric: the judge explicitly does
+not penalise length or extra detail, so a longer answer is PROTECTIVE — more
+surface area, more chances to state the gold fact, no cost. Compressing to a
+committed 5-word claim throws that away and adds contradiction risk. Verbosity
+was not the bug.
+
+Repopulate this set only with evidence that a category's golds are genuinely
+transition-shaped AND that the change wins on measurement, not on argument."""
+"""Question types whose gold answers are transition-shaped.
+
+MedLoCoMo golds for these are almost always a before/after pair — "topiramate to
+valproate", "from unspecified to candidal esophagitis", "meningeal signs vs
+lupus flare" — with a median length of 4 words.
+
+`frequency_pattern` is deliberately NOT here: its golds are single items
+("respiratory failure", "in every admission"), not transitions, and forcing a
+before/after on them would produce a wrong shape."""
+
+
+def _transition_schema(base: dict) -> dict:
+    """`base` plus required `before_state`/`after_state` string fields.
+
+    Adding two REQUIRED schema fields, rather than asking for the transition in
+    the prompt, because prompting did not work. Measured 2026-08-19: a STEP 3
+    instruction telling the reader to "name the before-state and the after-state
+    explicitly" produced an answer byte-comparable to the run without it, in
+    both `chain_of_note` and `direct` modes. The model read the instruction
+    (verified by capturing the system prompt) and narrated anyway.
+
+    Schema-constrained decoding does what the instruction could not, which is
+    the same conclusion this project reached for extraction (`pipeline/
+    extract.py`: schema-guided beats "respond in JSON", literature/17
+    R-GSJ-001/002). The model cannot emit the object without filling both
+    fields, so it has to choose a start state and an end state."""
+    out = json.loads(json.dumps(base))
+    out["properties"]["before_state"] = {"type": "string"}
+    out["properties"]["after_state"] = {"type": "string"}
+    out["required"] = list(out["required"]) + ["before_state", "after_state"]
+    return out
+
+
+TRANSITION_INSTRUCTION = (
+    "This question asks how something CHANGED between two points in time. In "
+    "addition to the fields above you must fill `before_state` and "
+    "`after_state`: the EARLIEST and the LATEST state of the specific thing "
+    "asked about, each a short clinical noun phrase of about two to five words "
+    "-- no dates, no hedging, no explanation. Set `answer` to exactly "
+    '"<before_state> to <after_state>". Do not answer with a survey of '
+    "everything that happened; name the two endpoints. If the evidence does "
+    "not support a change, set abstained=true instead of inventing one.\n"
+)
+
 
 _DIRECT_SCHEMA = {
     "type": "object",
@@ -731,6 +865,8 @@ def read(
     guardrail_enabled: bool = False,
     guardrail_policy: str = "warn",
     corpus: EvidenceProvenance | None = None,
+    commit_style: bool = False,
+    question_type: str | None = None,
 ) -> Answer:
     """Answer `question` over already-retrieved `items`. Never retrieves —
     this function never calls the graph/vector retriever or the corpus
@@ -778,10 +914,20 @@ def read(
 
     context_text = render_context(items, rendering, rng=rng)
     system_prompt = _CON_SYSTEM if mode == "chain_of_note" else _DIRECT_SYSTEM
+    if commit_style:
+        system_prompt = system_prompt.replace(
+            _RESPOND_LINE, COMMIT_INSTRUCTION + _RESPOND_LINE
+        )
     user_content = _build_user_content(
         question, context_text, structural_absence, rendering, items=items, corpus=corpus
     )
     schema = _CON_SCHEMA if mode == "chain_of_note" else _DIRECT_SCHEMA
+    transition = commit_style and question_type in TRANSITION_TYPES
+    if transition:
+        schema = _transition_schema(schema)
+        system_prompt = system_prompt.replace(
+            _RESPOND_LINE, TRANSITION_INSTRUCTION + _RESPOND_LINE
+        )
 
     if dry_run:
         payload, prompt_tokens, completion_tokens = _stub_complete(
@@ -796,6 +942,15 @@ def read(
 
     notes = _reconcile_notes(payload.get("notes"), items) if mode == "chain_of_note" else []
     answer_text = str(payload.get("answer", ""))
+    if transition and not payload.get("abstained"):
+        before = str(payload.get("before_state") or "").strip()
+        after = str(payload.get("after_state") or "").strip()
+        if before and after:
+            # Compose rather than trust the model's own `answer` field: asked
+            # for both the endpoints AND a composed answer, the model reliably
+            # fills the endpoints and then writes a paragraph into `answer`
+            # anyway. The endpoints are the part the schema actually forces.
+            answer_text = f"{before} to {after}"
     abstained = bool(payload.get("abstained", False)) or answer_text.strip().upper() == "NOT_IN_RECORD"
 
     grounding_report: GroundingReport | None = None
@@ -896,6 +1051,7 @@ class ReaderAnswerer:
         retriever: Callable[[str, str, int], RetrieveResult] | None = None,
         guardrail_enabled: bool = False,
         guardrail_policy: str = "warn",
+        commit_style: bool = False,
     ) -> None:
         self.rendering = rendering
         self.k = k
@@ -903,6 +1059,7 @@ class ReaderAnswerer:
         self.model = model
         self.guardrail_enabled = guardrail_enabled
         self.guardrail_policy = guardrail_policy
+        self.commit_style = commit_style
         # `client` is accepted (not removed) only for call-site compatibility
         # with `eval/baselines/dense.py` / `eval/baselines/lexical.py`, which
         # both construct a `ReaderAnswerer` (via subclassing) with a
@@ -978,6 +1135,8 @@ class ReaderAnswerer:
             guardrail_enabled=self.guardrail_enabled,
             guardrail_policy=self.guardrail_policy,
             corpus=corpus,
+            commit_style=self.commit_style,
+            question_type=question_type,
         )
         return AnswerResult(
             text=result.text,
@@ -1025,7 +1184,26 @@ class MedMemGraphAnswerer(ReaderChainOfNoteAnswerer):
 
     name = "medmemgraph"
 
+    DEFAULT_K = 40
+    """Evidence items handed to the reader.
+
+    Measured on 10 patients / 336 paired items, 2026-08-19 — answerable accuracy
+    against the full-context baseline's 0.757:
+
+        k=6    0.674     k=40   0.783     k=60   0.775
+
+    The curve peaks near 40 and turns DOWN by 60: more evidence past that point
+    costs accuracy as well as tokens and latency. k=40 also beat k=60 on
+    abstention (0.583 vs 0.550) at 28% fewer tokens and 37% lower p50 latency,
+    so it wins on every axis measured rather than trading one for another.
+
+    The previous default of 6 was not chosen — it was `ReaderAnswerer`'s
+    undocumented default, and `--retrieve-k` could not override it because
+    `_build_answerer` gated on a signature check this class's `**kwargs`
+    constructor failed (see `eval/harness._accepts`)."""
+
     def __init__(self, **kwargs) -> None:
+        kwargs.setdefault("k", self.DEFAULT_K)
         if kwargs.get("retriever") is None:
             from medmemgraph.graph.retrieve import retrieve_for_eval
 

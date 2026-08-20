@@ -33,8 +33,10 @@ from medmemgraph.eval.reader import (
     Note,
     ReaderChainOfNoteAnswerer,
     ReaderDirectAnswerer,
+    TRANSITION_TYPES,
     _default_retriever,
     _split_timestamp,
+    _transition_schema,
     read,
     render_context,
 )
@@ -673,3 +675,47 @@ class TestTimestampExtractionMatchesRealProducers:
             )
         ]
         assert "time unknown" not in render_context(items, "prose")
+
+
+class TestTransitionForcingIsOffAndStaysOff:
+    """The forced before/after schema is disabled after measuring that it hurt.
+
+    Kept as code rather than deleted because the mechanism is reusable and the
+    negative result is worth more than the code: two REQUIRED schema fields DO
+    change the answer shape where a prompt instruction does not. What sank it is
+    that demanding a before-state for a question whose gold is a single state
+    manufactures a second term, often a negation, and the judge scores that as
+    contradicting the gold — a failure mode that had never once fired before."""
+
+    def test_disabled_by_default(self):
+        assert TRANSITION_TYPES == frozenset(), (
+            "re-enable only with measurement, not argument — see the constant's docstring"
+        )
+        assert inspect.signature(read).parameters["commit_style"].default is False
+
+    def test_schema_helper_still_works_if_re_enabled(self):
+        """The mechanism is intact for a future, better-scoped attempt."""
+        base = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        }
+        out = _transition_schema(base)
+        assert set(out["properties"]) == {"answer", "before_state", "after_state"}
+        assert set(out["required"]) == {"answer", "before_state", "after_state"}
+        assert base["required"] == ["answer"], "must not mutate the caller's schema"
+
+    def test_no_transition_fields_requested_by_default(self, monkeypatch):
+        """A transition-typed question must NOT get the extra required fields
+        while the feature is off."""
+        seen = {}
+
+        def _fake(prompt, **kw):
+            seen["schema"] = kw.get("schema") or {}
+            raise RuntimeError("stop")
+
+        monkeypatch.setattr(llm, "complete", _fake)
+        items = [RetrieveItem(text="x", session_id="1", turn_ids=[1], score=1.0, channel="graph")]
+        with pytest.raises(RuntimeError):
+            read("q", items, "chain_of_note", question_type="longitudinal_progression")
+        assert "before_state" not in (seen["schema"].get("properties") or {})

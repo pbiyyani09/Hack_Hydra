@@ -33,8 +33,16 @@ earlier state.
 - [ ] `git ls-files | rg -n "\.env$|auth-token$"` returns nothing. No
       secrets or auth tokens tracked.
 - [ ] `rg -n "beat full-context|outperforms full context" README.md
-      demo/VIDEO_SCRIPT.md` returns nothing. No accuracy-win claim
-      anywhere stranger-facing.
+      demo/VIDEO_SCRIPT.md` returns nothing. The measured result is a HIGHER
+      POINT ESTIMATE (0.783 vs 0.757) that is **not statistically significant**
+      (paired McNemar p = 0.20, 0.60 Holm-adjusted, MDE 0.063 at n = 336).
+      "Matches or exceeds at 8x fewer tokens" is supported and is what the
+      README says; "beats" is not, and `eval/report.py` refuses to print it.
+
+- [ ] **Results are current.** README § Results shows 0.783 answerable / 0.583
+      abstention / 9,703 mean tokens for MedMemGraph against full-context's
+      0.757 / 0.517 / 80,557, on 10 patients and 336 paired items. Zero `TBD`
+      cells anywhere.
 - [ ] `.gitignore` still covers `data/`, `.env`, `auth-token`, and the
       usual Python build artifacts (`__pycache__/`, `.pytest_cache/`,
       `*.egg-info/`, `dist/`, `build/`). Diff it against the last known-good

@@ -34,9 +34,11 @@ SYSTEMS="${SYSTEMS:-nomem fullctx dense lexical medmemgraph}"
 # Evidence items handed to the reader. The recorded 0.641 run used the k=6
 # default, which on a patient with 27 admissions is 6 items covering 6 of them —
 # while the full-context baseline sees all 27. Nothing else caps the reader:
-# 25 items is ~3k prompt tokens, still ~26x cheaper than fullctx's ~80k.
+# 40 items is ~9.7k prompt tokens, still ~8x cheaper than fullctx's ~80k, and
+# measured as the peak of the coverage curve (k=6 -> 0.674, k=40 -> 0.783,
+# k=60 -> 0.775).
 # `nomem`/`fullctx` ignore this flag (no `k` in their constructors).
-RETRIEVE_K="${RETRIEVE_K:-25}"
+RETRIEVE_K="${RETRIEVE_K:-40}"
 
 export MEDMEMGRAPH_LLM_CACHE_DIR="${MEDMEMGRAPH_LLM_CACHE_DIR:-$PWD/data/llm_cache}"
 

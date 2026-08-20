@@ -25,7 +25,10 @@ from medmemgraph import llm
 
 from medmemgraph.eval.baselines.fullctx import FullContextAnswerer
 from medmemgraph.eval.baselines.nomem import NoMemoryAnswerer
+from medmemgraph.eval.reader import MedMemGraphAnswerer
 from medmemgraph.eval.harness import (
+    _accepts,
+    _build_answerer,
     ADVERSARIAL_TYPE,
     QUESTION_TYPES,
     SCOPES,
@@ -419,3 +422,42 @@ class TestNoApiKeyFailsLoudly:
                 system_name="nomem",
                 dry_run=False,
             )
+
+
+class TestRetrieveKReachesTheSystem:
+    """`--retrieve-k` must reach a factory that takes `**kwargs`.
+
+    Regression for a silent no-op: `_build_answerer` gated on
+    `"k" in inspect.signature(factory).parameters`, and
+    `MedMemGraphAnswerer.__init__(self, **kwargs)` reports its parameters as
+    `['self', 'kwargs']`. So the flag parsed, threaded through `evaluate`,
+    reached the gate, and was dropped one line short of its destination. Every
+    medmemgraph run used the k=6 default regardless of the flag, with no error
+    and no warning — the only symptom was prompt token counts not moving when k
+    was raised."""
+
+    def test_k_reaches_a_kwargs_only_factory(self):
+        answerer = _build_answerer("medmemgraph", dry_run=True, model=None, retrieve_k=60)
+        assert answerer.k == 60
+
+    def test_default_k_when_flag_absent(self):
+        """The default is the MEASURED peak of the coverage curve, not an
+        inherited constant. k=6 -> 0.674, k=40 -> 0.783, k=60 -> 0.775 answerable
+        over 336 paired items; see `MedMemGraphAnswerer.DEFAULT_K`."""
+        answerer = _build_answerer("medmemgraph", dry_run=True, model=None)
+        assert answerer.k == MedMemGraphAnswerer.DEFAULT_K == 40
+
+    def test_factory_without_k_is_not_broken_by_the_flag(self):
+        """`nomem`/`fullctx` genuinely take no `k`; passing one must not raise."""
+        assert _build_answerer("nomem", dry_run=True, model=None, retrieve_k=60) is not None
+
+    def test_accepts_helper(self):
+        import inspect
+
+        def explicit(k=1): ...
+        def via_kwargs(**kw): ...
+        def neither(a=1): ...
+
+        assert _accepts(inspect.signature(explicit).parameters, "k")
+        assert _accepts(inspect.signature(via_kwargs).parameters, "k")
+        assert not _accepts(inspect.signature(neither).parameters, "k")

@@ -108,6 +108,17 @@ class Record:
     tokens: int
     latency_ms: float
     truncated: bool
+    answer_text: str = ""
+    """What the system actually answered.
+
+    Added 2026-08-19. Until then the answer was handed to the judge and then
+    dropped, so a results file recorded the judge's VERDICT on an answer nobody
+    could read back. Any question about how answers were phrased — the thing
+    that turned out to drive 44% of our temporal losses — could only be
+    investigated by re-running the whole eval and paying for it again.
+
+    Kept verbatim and untruncated: the point is to be able to audit the exact
+    text the judge saw."""
 
 
 @dataclass
@@ -303,6 +314,7 @@ def evaluate(
                 tokens=result.total_tokens,
                 latency_ms=result.latency_ms,
                 truncated=result.truncated,
+                answer_text=result.text,
             )
         )
 
@@ -371,11 +383,31 @@ def _build_answerer(
     # system-name check, so a future baseline with the same kwarg names
     # picks this up for free.
     sig_params = inspect.signature(factory).parameters
-    if rendering is not None and "rendering" in sig_params:
+    if rendering is not None and _accepts(sig_params, "rendering"):
         kwargs["rendering"] = rendering
-    if retrieve_k is not None and "k" in sig_params:
+    if retrieve_k is not None and _accepts(sig_params, "k"):
         kwargs["k"] = retrieve_k
     return factory(**kwargs)
+
+
+def _accepts(sig_params, name: str) -> bool:
+    """Does this factory accept `name`, directly or via `**kwargs`?
+
+    The `name in sig_params` test alone is wrong for any class that forwards
+    with `**kwargs`, and it silently did the wrong thing for the headline
+    system: `MedMemGraphAnswerer.__init__(self, **kwargs)` reports its
+    parameters as `['self', 'kwargs']`, so `"k" in sig_params` was False and the
+    harness quietly dropped `--retrieve-k`.
+
+    Every medmemgraph run before 2026-08-19 therefore used the k=6 default no
+    matter what the flag said — the flag parsed, threaded through `evaluate`,
+    reached this function, and was discarded one line from its destination. The
+    failure produced no error and no warning; the only visible symptom was that
+    prompt token counts did not move when k was raised, which is only
+    noticeable if you happen to check."""
+    if name in sig_params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
 
 
 def run_harness(

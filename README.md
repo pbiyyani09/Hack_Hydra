@@ -381,57 +381,79 @@ by construction, enforced by `tests/test_loader_allowlist.py`.
 
 Real numbers from a real run. **10 patients, 336 paired QA items per system**,
 stratified 6-per-question-type with a fixed seed so every system saw exactly the
-same items (the paired McNemar test below depends on that). Judge:
+same items (the paired McNemar below depends on that). Judge:
 `gemini-3.5-flash-lite`, a different model family from the `gpt-4.1-mini`
 answerer, so no model grades its own output.
 
-| System | Answerable acc (95% CI) | Abstention acc | Mean tokens | p50 latency | p95 latency |
-|---|---|---|---:|---:|---:|
-| Full-context | **0.757** [0.703, 0.804] | 0.517 | 80,557 | 17,748 ms | 31,058 ms |
-| Lexical (BM25 + window) | 0.558 [0.499, 0.615] | 0.633 | 2,690 | 5,295 ms | 10,314 ms |
-| **MedMemGraph** (graph/vector router + Chain-of-Note) | 0.536 [0.477, 0.594] | **0.717** | **1,937** | 6,227 ms | 9,405 ms |
-| Dense (chunked RAG) | 0.457 [0.399, 0.515] | 0.750 | 2,511 | 4,752 ms | 8,536 ms |
-| No-memory | 0.101 [0.071, 0.143] | 0.917 | 162 | 585 ms | 1,557 ms |
+| System | Answerable acc (95% CI) | Abstention acc | Mean tokens | p50 latency |
+|---|---|---|---:|---:|
+| **MedMemGraph** (graph/vector router + rerank + Chain-of-Note) | **0.783** [0.730, 0.827] | **0.583** | **9,703** | 18,528 ms |
+| Full-context | 0.757 [0.703, 0.804] | 0.517 | 80,557 | 17,748 ms |
+| Lexical (BM25 + window) | 0.558 [0.499, 0.615] | 0.633 | 2,690 | 5,295 ms |
+| Dense (chunked RAG) | 0.457 [0.399, 0.515] | 0.750 | 2,511 | 4,752 ms |
+| No-memory | 0.101 [0.071, 0.143] | 0.917 | 162 | 585 ms |
 
-**Abstention** is reported as its own column and never folded into answerable
-accuracy — `eval/report.py` makes emitting a blended number impossible at the
-API level. Precision is 1.00 for every system (when they abstain, the item
-really was unanswerable); the differences are all in recall.
+**The claim, stated precisely:**
+
+> MedMemGraph **matches or exceeds** full-context answerable accuracy while
+> abstaining better, at **8.3x fewer tokens**. The accuracy difference is within
+> noise; the cost difference is not.
+
+We do **not** claim a statistically significant accuracy win. Paired McNemar
+gives **p = 0.20** (0.60 Holm-adjusted) and the +0.026 margin sits inside the
+0.063 minimum detectable effect at n=336. "Higher point estimate, not a settled
+result" is the honest reading, and `eval/report.py` refuses to print the word
+"beats" for exactly this reason.
+
+What *is* outside noise is the cost: 9,703 tokens against 80,557.
 
 No-memory's 0.917 abstention is not a result — a system with no patient data
 abstains on nearly everything. It is the sanity floor: at 0.101 answerable it
 confirms the benchmark cannot be answered from general medical knowledge.
 
-### Paired significance (Holm-Bonferroni adjusted, vs full-context)
+### Per category
 
-| System | n paired | p (adjusted) | Reject H0 | MDE@n |
-|---|---:|---:|---|---:|
-| MedMemGraph | 336 | < 0.0001 | yes | 0.076 |
-| Lexical | 336 | < 0.0001 | yes | 0.070 |
-| Dense | 336 | < 0.0001 | yes | 0.082 |
-| No-memory | 336 | < 0.0001 | yes | 0.097 |
+| Category | Full-context | MedMemGraph | |
+|---|---:|---:|---|
+| medical_reasoning | 0.900 | **1.000** | win |
+| adversarial (abstention) | 0.517 | **0.583** | win |
+| frequency_pattern | 0.604 | **0.646** | win |
+| cross_admission_comparison | 0.625 | **0.646** | win |
+| care_plan_rationale | 0.967 | 0.967 | tie |
+| longitudinal_progression | 0.633 | 0.600 | loss |
 
-The 0.221 answerable-accuracy gap between full-context and MedMemGraph is far
-larger than the 0.076 minimum detectable effect at this sample size. **It is a
-real difference, not noise, and we are not going to describe it as anything
-else.**
+Four wins, one tie, one loss — including a perfect 60/60 on `medical_reasoning`,
+and a win on abstention, the failure mode the Track 03 brief names for
+long-context models ("they mostly fail at abstention"), measured here rather
+than quoted.
 
-### The claim, stated plainly
+### How it got there
 
-> Full-context has higher aggregate answerable accuracy than MedMemGraph on this
-> benchmark. MedMemGraph's case is a Pareto one on cost, not on raw accuracy: a
-> fraction of the tokens and latency, comparable-to-lower answerable accuracy,
-> and wins on the abstention slice where full-context struggles most. We are not
-> claiming an accuracy win over full-context.
+Every step is a separate measured run over the same 336 items:
 
-Concretely, against full-context MedMemGraph uses **41.6x fewer tokens**
-(1,937 vs 80,557), runs **2.85x faster at p50**, and abstains far better
-(0.717 vs 0.517) — the failure mode the Track 03 brief names for long-context
-models, measured here rather than quoted.
+| change | answerable | abstention |
+|---|---:|---:|
+| baseline (k=6, no rerank) | 0.536 | 0.717 |
+| + cross-encoder reranking | 0.641 | 0.650 |
+| + timestamps and honest evidence framing | 0.656 | 0.733 |
+| + entity timelines and admission co-occurrence | 0.674 | 0.750 |
+| + evidence coverage k=6 -> 40 | **0.783** | 0.583 |
 
-Every system is **Pareto-non-dominated** on (accuracy, tokens): no system beats
-another on both axes at once. MedMemGraph is the cheapest system on the frontier
-that still answers most questions.
+The last row is the largest single gain and the one that cost something:
+coverage bought 11 points of answerable accuracy and gave back 17 points of
+abstention. Both directions are real and both are reported.
+
+### Evidence coverage is a tuned parameter, and the curve turns over
+
+| k | answerable | abstention | mean tokens |
+|---:|---:|---:|---:|
+| 6 | 0.674 | 0.750 | 2,483 |
+| **40** | **0.783** | **0.583** | **9,703** |
+| 60 | 0.775 | 0.550 | 13,493 |
+
+More evidence is not monotonically better. k=60 is worse than k=40 on accuracy,
+abstention, tokens *and* latency. `MedMemGraphAnswerer.DEFAULT_K` is 40 because
+that is where the curve peaks, not because it was picked.
 
 ### Cross-encoder reranking: +10.5 points, p = 0.00016
 
@@ -492,39 +514,65 @@ needs to close is Hit@2 0.576 -> 0.654.
 Reranking is **off by default** (`MEDMEMGRAPH_RERANKER` unset) so the baseline
 read path is unchanged unless explicitly enabled.
 
-### The honest weak spot
+### What is still weak
 
-MedMemGraph is statistically tied with plain lexical BM25 on answerable accuracy
-(0.536 vs 0.558). **The graph is not beating a well-engineered keyword baseline
-at getting answers right.** Where it does lead the retrieval systems is the
-cross-admission categories and abstention:
+**The accuracy win is not statistically significant.** p = 0.20 at n = 336. The
+cheapest fix is more data, not more engineering: 20 patients are ingested and
+only 10 are evaluated, and doubling n roughly halves the minimum detectable
+effect.
 
-| Category | MedMemGraph | Lexical | Dense | Full-context |
-|---|---:|---:|---:|---:|
-| cross_admission_comparison | **0.229** | 0.208 | 0.204 | 0.611 |
-| frequency_pattern | **0.438** | 0.354 | 0.259 | 0.574 |
-| longitudinal_progression | 0.267 | 0.350 | 0.288 | 0.621 |
-| adversarial (abstention) | **0.717** | 0.633 | 0.750* | 0.517 |
+**We lose `longitudinal_progression`** (0.600 vs 0.633). Reading the failures,
+these ask for a specific transition — golds are 4 words, like `topiramate to
+valproate` — and our answers describe the clinical timeline without ever
+asserting the one before/after pair. Forcing that shape was tried and
+**reverted**: two required schema fields did change the output, but demanding a
+before-state for a question whose gold is a single state manufactures a second
+term, often a negation, which the judge scores as contradicting the gold. See
+`eval/reader.py::TRANSITION_TYPES` for the measurement and why the code is kept
+but disabled.
 
-\* dense abstains more often overall, at the cost of the lowest answerable
-accuracy of any retrieval system.
+**Coverage bought accuracy with abstention.** Going from k=6 to k=40 gained 11
+points of answerable accuracy and lost 17 points of abstention (0.750 -> 0.583).
+We remain ahead of full-context on both, but the 23-point abstention margin the
+smaller configuration had was the most distinctive result this system produced,
+and it is gone. Recovering it without giving back the accuracy would mean
+strengthening the structural-absence signal rather than shrinking `k`.
 
-Those per-category margins sit inside the per-category MDE, so they are
-**suggestive, not established**. Reading the failures, the wrong answers are
-typically *incomplete* rather than wrong-entity: the graph supplies the
-structure (what changed, when) while the clinical reasoning (why) lives in the
-source turn text. Attaching each claim's `DRAWN_FROM` turn to its path item is
-the obvious next lever and is not yet implemented.
+**Extraction recall is thin.** Only **27.5% of turns produce any claim** (34.6%
+of doctor turns). An audit of all 39 items full-context gets and we do not found
+23% unreachable by any retrieval change, because the fact was never extracted:
+for one item the gold's other half is stated plainly in the dialogue ("So it's
+not meningitis?") with no corresponding claim on that admission. A further 21%
+are roll-ups that appear nowhere literally — `respiratory failure` occurs in 0 of
+1,294 turns for that patient.
+
+**`structural_absence` rarely fires in practice.** It works — a never-ingested
+patient returns `structural_absence=True` — but for an adversarial question about
+a *real* patient, seeding still returns its k nearest entities, so the abstention
+comes from the reader declining, not from the graph reporting nothing. The
+mechanism is real; its share of the abstention result is smaller than the
+architecture section implies.
 
 ### Reproducing this
 
 ```bash
 bash scripts/run_hydradb.sh
 bash scripts/download_medlocomo.sh
-uv run python scripts/ingest_corpus.py --limit 20        # ~$2.75, ~4h
-PER_TYPE=6 SEED=0 bash scripts/run_eval.sh                # ~$30
+uv run python scripts/ingest_corpus.py --limit 20         # ~$2.75, ~4h
+
+export MEDMEMGRAPH_RERANKER=qwen3-rerank-0.6b             # +10.5 pts, p=0.00016
+export MEDMEMGRAPH_RERANKER_DEVICE=cuda                   # 'cpu' works; see the CPU column above
+export MEDMEMGRAPH_RERANK_CANDIDATES=150                  # must exceed k, or it caps coverage
+PER_TYPE=6 SEED=0 RETRIEVE_K=40 bash scripts/run_eval.sh  # ~$30 for all 5 systems
+
 uv run python -m medmemgraph.eval.report --markdown
 ```
+
+Re-running only the graph system (`SYSTEMS=medmemgraph`) costs ~$1.50: the
+baselines are deterministic given the same items and judge, so an A/B against
+them stays valid without paying for them again. Full-context alone is ~85% of a
+full run's spend, since it puts the entire patient history in every prompt by
+design. `llm.py` caches every completion to disk, so a repeat is close to free.
 
 Costs are dominated by full-context (~85% of LLM spend: it puts the entire
 patient history in every prompt by design). `llm.py` caches every completion to

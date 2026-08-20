@@ -103,15 +103,20 @@ pattern this codebase explicitly bans.
 
 | Time | Shot | Words / on-screen |
 |---|---|---|
-| 2:05-2:15 | On screen: the per-category results table (`README.md` § Results, filled at freeze). Abstention shown as its own row, tokens and latency in the same table. **Pause recording** until real numbers are in; do not read placeholder `TBD` cells on camera. | (table on screen, no VO yet) |
-| 2:15-2:25 | Speak the Pareto sentence that actually matches the freeze numbers (`README.md` has both the win-case and the honest-loss-case sentence pre-written; say whichever one the real table supports). | VO (win case): "Comparable accuracy at a fraction of the tokens and latency. Wins, if any, on cross-admission, temporal, and abstention. We do not claim a raw accuracy win over full-context." (Or the honest-loss variant from the README, if that is what the numbers show.) |
+| 2:05-2:15 | On screen: the results table from `README.md` § Results. Abstention is its own column; tokens and latency are in the same table. The numbers are measured and final — no `TBD` cells remain. | (table on screen, no VO yet) |
+| 2:15-2:25 | Speak the sentence the measured table supports — and only that sentence. | VO: "Point seven eight three against full-context's point seven five seven, on the same three hundred and thirty-six questions, using eight times fewer tokens — and abstaining better. The accuracy difference is inside the noise at this sample size, so we call it a match, not a win. The cost difference is not inside the noise." |
 | 2:25-2:30 | Closing card: "MedMemGraph. Built on HydraDB OSS 0.1.1, AGPL-3.0. github.com/pbiyyani09/Hack_Hydra" | (text on screen) |
 
-**Must say on camera, in these words or very close to them:** "we do not
-claim a raw accuracy win over full-context." If the real numbers show
-full-context winning aggregate accuracy, that goes in the voiceover too,
-in plain words; see the honest-loss sentence in `README.md`. This is not
-optional and is not something to soften at 23:00 on the 20th.
+**Must say on camera:** that the accuracy difference is **within noise**
+(p = 0.20 at n = 336) and that the cost difference is not. Saying "we beat
+full-context" without that qualifier over-reads a p = 0.20 result, and a judge
+who checks `eval/report.py` will find it refuses to print the word "beats" for
+exactly this reason. Claiming the match honestly is stronger than claiming a win
+that the statistics do not support.
+
+**Also worth 5 seconds if the pacing allows:** we win `medical_reasoning`
+60/60 and win abstention (0.583 vs 0.517) — the failure mode the track
+description names for long-context models.
 
 **Must name on camera:** HydraDB OSS, and that it is used self-hosted (no
 managed API).
@@ -127,7 +132,8 @@ beats (1 and 3), not room for a fifth beat.
 ## What this video does not do
 
 - No fifth beat, no new retrieval channel introduced for the camera.
-- No claim of an accuracy win over full-context, framed any way.
+- No claim of a *statistically significant* accuracy win. The higher point
+  estimate is real and sayable; "beats" is not, at p = 0.20.
 - No demo of `CLOUD_PROVIDER=local`, a managed HydraDB endpoint, or any
   network call that is not this project's own self-hosted container.
 - No six-class polarity framing (decision 002 stays open; the demo speaks

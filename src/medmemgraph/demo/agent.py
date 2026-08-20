@@ -185,6 +185,14 @@ def chat_once(
         "chain_of_note",
         structural_absence=pack.structural_absence,
         dry_run=dry_run,
+        # The demo keeps the fuller clinical answer. `commit_style` (on by
+        # default) instructs the reader to compress a progression into the one
+        # "X to Y" transition MedLoCoMo's gold answers are written as — which
+        # wins points on the benchmark and is the wrong thing to show a
+        # clinician, who wants the intervening detail and the citations. Same
+        # retrieval, same facts, different framing; the README says so rather
+        # than letting this screen imply the eval answers look like this.
+        commit_style=False,
     )
 
     refusing = pack.structural_absence or con_answer.abstained
