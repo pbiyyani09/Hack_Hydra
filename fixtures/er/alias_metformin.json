@@ -1,0 +1,56 @@
+{
+  "_comment": "Synthetic multi-session ClinicalFact-shaped mentions for one patient (E3-S1 story). Do NOT vendor MedLoCoMo text here — every string below is invented for this fixture. Mirrors the story's own worked example: the same medication recurring across admissions as 'metformin' / 'Glucophage' / a case+punctuation variant / a colloquial description, plus one distinct medication (furosemide) to prove blocking never falsely merges unrelated entities. `fact_id` values are placeholders (this fixture is consumed before minting, tests/test_resolve.py fills the rest of ClinicalFact's required fields).",
+  "patient_id": "patient-alias-0001",
+  "facts": [
+    {
+      "fact_id": "fixture-0001",
+      "session_id": "admission-alias-01",
+      "turn_ids": [3],
+      "predicate": "TAKES_MEDICATION",
+      "object_name": "metformin",
+      "object_type": "Medication",
+      "valid_from": "2124-01-05T09:00:00",
+      "note": "session 1, formal generic name"
+    },
+    {
+      "fact_id": "fixture-0002",
+      "session_id": "admission-alias-01",
+      "turn_ids": [7],
+      "predicate": "TAKES_MEDICATION",
+      "object_name": "Glucophage",
+      "object_type": "Medication",
+      "valid_from": "2124-01-05T09:04:00",
+      "note": "session 1, US brand name for the same drug"
+    },
+    {
+      "fact_id": "fixture-0003",
+      "session_id": "admission-alias-02",
+      "turn_ids": [2],
+      "predicate": "TAKES_MEDICATION",
+      "object_name": "the 500mg one",
+      "object_type": "Medication",
+      "valid_from": "2124-03-11T10:00:00",
+      "note": "session 2, colloquial description — documented, NOT bridged by this story's lexical-only blocking (see resolve.py module docstring); kept in the fixture on purpose so the honest gap is exercised by a test, not hidden"
+    },
+    {
+      "fact_id": "fixture-0004",
+      "session_id": "admission-alias-02",
+      "turn_ids": [5],
+      "predicate": "TAKES_MEDICATION",
+      "object_name": "METFORMIN.",
+      "object_type": "Medication",
+      "valid_from": "2124-03-11T10:05:00",
+      "note": "session 2, case+punctuation variant of session 1's generic name — exact normalized-key bridge"
+    },
+    {
+      "fact_id": "fixture-0005",
+      "session_id": "admission-alias-02",
+      "turn_ids": [9],
+      "predicate": "TAKES_MEDICATION",
+      "object_name": "furosemide",
+      "object_type": "Medication",
+      "valid_from": "2124-03-11T10:10:00",
+      "note": "a genuinely distinct medication — must never merge with any metformin variant above"
+    }
+  ]
+}

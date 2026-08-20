@@ -1,0 +1,388 @@
+{
+  "qas": [
+    {
+      "qa_id": "probe-13718173-update-20834526-22428429-000__now",
+      "scope": "cross_admission",
+      "question_type": "update",
+      "question": "Is the patient currently taking sertraline?",
+      "answer": "no, sertraline was discontinued",
+      "evidence": {
+        "admissions": [
+          "20834526",
+          "22428429"
+        ],
+        "turn_ids": [
+          61,
+          86
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-13718173-update-20834526-22428429-000__asof",
+      "scope": "single_admission",
+      "question_type": "update",
+      "question": "As of 2158-11-03, was the patient taking sertraline?",
+      "answer": "yes, taking sertraline",
+      "evidence": {
+        "admissions": [
+          "20834526"
+        ],
+        "turn_ids": [
+          61
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-12882985-update-22264706-27496926-001__now",
+      "scope": "cross_admission",
+      "question_type": "update",
+      "question": "Does the patient currently have acute kidney injury?",
+      "answer": "no, acute kidney injury has resolved",
+      "evidence": {
+        "admissions": [
+          "22264706",
+          "27496926"
+        ],
+        "turn_ids": [
+          86,
+          86
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-12882985-update-22264706-27496926-001__asof",
+      "scope": "single_admission",
+      "question_type": "update",
+      "question": "As of 2147-02-08, did the patient have acute kidney injury?",
+      "answer": "yes, had acute kidney injury",
+      "evidence": {
+        "admissions": [
+          "22264706"
+        ],
+        "turn_ids": [
+          86
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-16663465-correction-27826133-27608153-002__now",
+      "scope": "cross_admission",
+      "question_type": "correction",
+      "question": "Does the patient have a documented latex allergy?",
+      "answer": "no, that earlier latex allergy entry was a charting error -- no known drug allergies",
+      "evidence": {
+        "admissions": [
+          "27826133",
+          "27608153"
+        ],
+        "turn_ids": [
+          66,
+          43
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-16663465-correction-27826133-27608153-002__asof",
+      "scope": "single_admission",
+      "question_type": "correction",
+      "question": "As of 2135-06-14, did the patient have a documented latex allergy?",
+      "answer": "yes, documented latex allergy",
+      "evidence": {
+        "admissions": [
+          "27826133"
+        ],
+        "turn_ids": [
+          66
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-10913302-contradiction-27555738-27100252-003__now",
+      "scope": "cross_admission",
+      "question_type": "contradiction",
+      "question": "Who is the patient's primary care provider?",
+      "answer": "conflicting reports on file -- Dr. Okafor vs Dr. Solheim; the record never reconciles which is current",
+      "evidence": {
+        "admissions": [
+          "27555738",
+          "27100252"
+        ],
+        "turn_ids": [
+          63,
+          61
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-10913302-contradiction-27555738-27100252-003__asof",
+      "scope": "single_admission",
+      "question_type": "contradiction",
+      "question": "As of 2194-07-15, who had the patient named as their primary care provider?",
+      "answer": "Dr. Okafor (the only report on file as of that date)",
+      "evidence": {
+        "admissions": [
+          "27555738"
+        ],
+        "turn_ids": [
+          63
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-16924675-update-22513352-21499101-004__now",
+      "scope": "cross_admission",
+      "question_type": "update",
+      "question": "What is the patient's current dose of furosemide?",
+      "answer": "40 mg",
+      "evidence": {
+        "admissions": [
+          "22513352",
+          "21499101"
+        ],
+        "turn_ids": [
+          68,
+          21
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-16924675-update-22513352-21499101-004__asof",
+      "scope": "single_admission",
+      "question_type": "update",
+      "question": "As of 2117-03-23, what was the patient's dose of furosemide?",
+      "answer": "20 mg",
+      "evidence": {
+        "admissions": [
+          "22513352"
+        ],
+        "turn_ids": [
+          68
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-12547294-update-21311796-24034398-005__now",
+      "scope": "cross_admission",
+      "question_type": "update",
+      "question": "Is the patient currently taking hydrochlorothiazide?",
+      "answer": "no, hydrochlorothiazide was discontinued",
+      "evidence": {
+        "admissions": [
+          "21311796",
+          "24034398"
+        ],
+        "turn_ids": [
+          68,
+          61
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-12547294-update-21311796-24034398-005__asof",
+      "scope": "single_admission",
+      "question_type": "update",
+      "question": "As of 2158-06-27, was the patient taking hydrochlorothiazide?",
+      "answer": "yes, taking hydrochlorothiazide",
+      "evidence": {
+        "admissions": [
+          "21311796"
+        ],
+        "turn_ids": [
+          68
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-10213338-update-29157166-20533804-006__now",
+      "scope": "cross_admission",
+      "question_type": "update",
+      "question": "Does the patient currently have atrial fibrillation?",
+      "answer": "no, atrial fibrillation has resolved",
+      "evidence": {
+        "admissions": [
+          "29157166",
+          "20533804"
+        ],
+        "turn_ids": [
+          52,
+          68
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-10213338-update-29157166-20533804-006__asof",
+      "scope": "single_admission",
+      "question_type": "update",
+      "question": "As of 2160-09-07, did the patient have atrial fibrillation?",
+      "answer": "yes, had atrial fibrillation",
+      "evidence": {
+        "admissions": [
+          "29157166"
+        ],
+        "turn_ids": [
+          52
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-18056245-correction-26879631-22343477-007__now",
+      "scope": "cross_admission",
+      "question_type": "correction",
+      "question": "Does the patient have a documented codeine allergy?",
+      "answer": "no, that earlier codeine allergy entry was a charting error -- no known drug allergies",
+      "evidence": {
+        "admissions": [
+          "26879631",
+          "22343477"
+        ],
+        "turn_ids": [
+          68,
+          45
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-18056245-correction-26879631-22343477-007__asof",
+      "scope": "single_admission",
+      "question_type": "correction",
+      "question": "As of 2132-03-01, did the patient have a documented codeine allergy?",
+      "answer": "yes, documented codeine allergy",
+      "evidence": {
+        "admissions": [
+          "26879631"
+        ],
+        "turn_ids": [
+          68
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-11413236-contradiction-25722424-22571027-008__now",
+      "scope": "cross_admission",
+      "question_type": "contradiction",
+      "question": "Who is the patient's primary care provider?",
+      "answer": "conflicting reports on file -- Dr. Alvarez vs Dr. Solheim; the record never reconciles which is current",
+      "evidence": {
+        "admissions": [
+          "25722424",
+          "22571027"
+        ],
+        "turn_ids": [
+          49,
+          41
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-11413236-contradiction-25722424-22571027-008__asof",
+      "scope": "single_admission",
+      "question_type": "contradiction",
+      "question": "As of 2187-10-09, who had the patient named as their primary care provider?",
+      "answer": "Dr. Alvarez (the only report on file as of that date)",
+      "evidence": {
+        "admissions": [
+          "25722424"
+        ],
+        "turn_ids": [
+          49
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-18136887-update-27934857-25235083-009__now",
+      "scope": "cross_admission",
+      "question_type": "update",
+      "question": "What is the patient's current dose of atorvastatin?",
+      "answer": "40 mg",
+      "evidence": {
+        "admissions": [
+          "27934857",
+          "25235083"
+        ],
+        "turn_ids": [
+          29,
+          29
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-18136887-update-27934857-25235083-009__asof",
+      "scope": "single_admission",
+      "question_type": "update",
+      "question": "As of 2166-11-02, what was the patient's dose of atorvastatin?",
+      "answer": "20 mg",
+      "evidence": {
+        "admissions": [
+          "27934857"
+        ],
+        "turn_ids": [
+          29
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-17517983-update-26765088-29353174-010__now",
+      "scope": "cross_admission",
+      "question_type": "update",
+      "question": "Is the patient currently taking hydrochlorothiazide?",
+      "answer": "no, hydrochlorothiazide was discontinued",
+      "evidence": {
+        "admissions": [
+          "26765088",
+          "29353174"
+        ],
+        "turn_ids": [
+          43,
+          47
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-17517983-update-26765088-29353174-010__asof",
+      "scope": "single_admission",
+      "question_type": "update",
+      "question": "As of 2125-04-24, was the patient taking hydrochlorothiazide?",
+      "answer": "yes, taking hydrochlorothiazide",
+      "evidence": {
+        "admissions": [
+          "26765088"
+        ],
+        "turn_ids": [
+          43
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-11021643-update-24973873-25291170-011__now",
+      "scope": "cross_admission",
+      "question_type": "update",
+      "question": "Does the patient currently have acute kidney injury?",
+      "answer": "no, acute kidney injury has resolved",
+      "evidence": {
+        "admissions": [
+          "24973873",
+          "25291170"
+        ],
+        "turn_ids": [
+          56,
+          29
+        ]
+      }
+    },
+    {
+      "qa_id": "probe-11021643-update-24973873-25291170-011__asof",
+      "scope": "single_admission",
+      "question_type": "update",
+      "question": "As of 2179-08-10, did the patient have acute kidney injury?",
+      "answer": "yes, had acute kidney injury",
+      "evidence": {
+        "admissions": [
+          "24973873"
+        ],
+        "turn_ids": [
+          56
+        ]
+      }
+    }
+  ]
+}
