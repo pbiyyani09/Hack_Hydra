@@ -25,10 +25,28 @@ with `backend="onnx"` and `file_name="onnx/model_qint8_avx512.onnx"`:
 
 22.0 MiB of graph per arm (22.7 MB RAM, 22.7 M params), 95 MB total.
 
-**`…-ft-listwise-onnx` is the best arm**: turn-grain nDCG@10 **0.778**
-at pool 200, 0.756 on the original hybrid pool, against 0.756/— for the
-unfinetuned baseline. Full sweep in `results/finetune-reranker/`
-(gitignored — that directory is local).
+**`…-ft-listwise-onnx` is the best arm.** The only apples-to-apples
+comparison is `same_pool_audit` — one pool built once (arctic-s + BM25
+hybrid, 100 candidates), all three rerankers looped over that identical
+pool, turn grain, n=231:
+
+| reranker | Hit@2 | nDCG@10 |
+|---|---|---|
+| `…-ft-listwise-onnx-int8` | **0.948** | **0.756** |
+| `qwen3-rerank-0.6b-ft-listwise` | 0.892 | 0.702 |
+| `qwen3-rerank-0.6b` (stock) | 0.701 | 0.556 |
+
+The higher **0.778** figure is the same arm at pool **200**. No Qwen arm
+was ever run at pool 200, and widening the pool 100 -> 200 is itself
+worth about +0.021, so 0.778 must NOT be compared against any Qwen
+number — use 0.756 for that.
+
+Note there is **no same-pool unfinetuned-MiniLM control**. What
+finetuning MiniLM bought over stock MiniLM is therefore unmeasured on
+this pool; the 0.461 stock figure in `ndcg_fixed.md` is a dense-only,
+non-hybrid pool and is not comparable.
+
+Full sweep in `results/finetune-reranker/` (gitignored — local only).
 
 ## What is not here, and why
 
