@@ -46,6 +46,10 @@ from medmemgraph.eval.baselines.nomem import NoMemoryAnswerer
 from medmemgraph.eval.judge import Judge
 from medmemgraph.eval.reader import (
     MedMemGraphAnswerer,
+    MedMemGraphP1Answerer,
+    MedMemGraphP1P2Answerer,
+    MedMemGraphP2Answerer,
+    MedMemGraphR1Answerer,
     ReaderChainOfNoteAnswerer,
     ReaderDirectAnswerer,
 )
@@ -63,7 +67,11 @@ SYSTEM_FACTORIES: dict[str, Callable[..., Answerer]] = {
     LexicalAnswerer.name: LexicalAnswerer,                # rung 4
     ReaderDirectAnswerer.name: ReaderDirectAnswerer,
     ReaderChainOfNoteAnswerer.name: ReaderChainOfNoteAnswerer,
-    MedMemGraphAnswerer.name: MedMemGraphAnswerer,    # the headline system
+    MedMemGraphAnswerer.name: MedMemGraphAnswerer,    # the headline system / control
+    MedMemGraphP1Answerer.name: MedMemGraphP1Answerer,        # arm P1: premise-check prompt
+    MedMemGraphP2Answerer.name: MedMemGraphP2Answerer,        # arm P2: decide-before-answer schema
+    MedMemGraphP1P2Answerer.name: MedMemGraphP1P2Answerer,    # arm P1+P2: both together
+    MedMemGraphR1Answerer.name: MedMemGraphR1Answerer,        # arm R1: aggregation prompt
 }
 """Registered baseline systems, keyed by name. Add a new baseline here to
 make it runnable by name from the CLI / evaluate(). `reader_direct` /
@@ -71,7 +79,24 @@ make it runnable by name from the CLI / evaluate(). `reader_direct` /
 `mock_retrieve`-sourced evidence pack, only the reading strategy differs —
 run both with `--system reader_direct reader_con` and diff the per-category
 tables below to compare `mode="direct"` against `mode="chain_of_note"` on
-identical retrieved evidence, per the story's A/B requirement."""
+identical retrieved evidence, per the story's A/B requirement.
+
+`medmemgraph_p1` / `medmemgraph_p2` / `medmemgraph_p1p2` are the same
+retrieval + Chain-of-Note reading as `medmemgraph` (the control), differing
+only in the abstention-trigger mechanism (see `reader.py`'s
+`premise_check_prompt`/`premise_check_schema` flags) — a cheap
+adversarial-only screen compares all four paired on identical items via
+`--system medmemgraph medmemgraph_p1 medmemgraph_p2 medmemgraph_p1p2
+--only-question-types adversarial`. `medmemgraph` itself sets neither flag
+and is unchanged by their existence.
+
+`medmemgraph_r1` is likewise the same retrieval + Chain-of-Note reading as
+`medmemgraph`, differing only in the roll-up-question aggregation
+instruction (see `reader.py`'s `aggregation_prompt` flag) — independent of
+`premise_check_prompt`/`premise_check_schema`, so it can be compared against
+`medmemgraph` directly via `--system medmemgraph medmemgraph_r1` on the
+answerable (non-adversarial) categories, or combined with P1/P2 in a later
+arm without this registry needing to change."""
 
 # Canonical row order — the six MedLoCoMo question_type categories named in
 # the story, verified present in the real corpus (see dev.log.md entry for
@@ -119,6 +144,14 @@ class Record:
 
     Kept verbatim and untruncated: the point is to be able to audit the exact
     text the judge saw."""
+    abstained: bool = False
+    """Copied straight from `AnswerResult.abstained` (the system's own
+    structured refusal flag). Added 2026-08-20 alongside `AnswerResult.
+    abstained` — until then the model's decision to decline was computed
+    (`reader.Answer.abstained`) and then dropped before it ever reached a
+    `Record`, so a results file could not distinguish "model declined but
+    the judge disagreed" from "model never declined": both looked like
+    `correct=False` on an adversarial item with no other trace."""
 
 
 @dataclass
@@ -258,6 +291,7 @@ def evaluate(
     seed: int = 0,
     rendering: str | None = None,
     retrieve_k: int | None = None,
+    only_question_types: list[str] | None = None,
     answerer: Answerer | None = None,
     judge: Judge | None = None,
 ) -> HarnessRun:
@@ -270,11 +304,24 @@ def evaluate(
     to the retriever) are only meaningful for the `reader_direct`/
     `reader_con` systems (eval/reader.py) — harmlessly ignored for
     `nomem`/`fullctx`, which do not accept those constructor kwargs (see
-    `_build_answerer`'s signature-introspection guard)."""
+    `_build_answerer`'s signature-introspection guard).
+
+    `only_question_types`, if given, restricts scoring to those
+    `question_type`s (e.g. `["adversarial"]` for a cheap abstention-only
+    screen). Applied AFTER sampling, not as a filter on `qa_items` before
+    it — filtering first would change which `qa_id`s `stratified_sample`
+    draws (it samples up to N per type from whatever `qa_items` it is
+    handed), silently breaking the qa_id pairing with any later full run
+    over the same seed. Filtering after sampling means a screen and a full
+    run drawn with the same `stratify_per_type`/`seed` always agree on
+    which items exist, one is just a subset of the other's qa_ids."""
     if stratify_per_type is not None:
         qa_items = stratified_sample(qa_items, stratify_per_type, seed=seed)
     elif k is not None:
         qa_items = qa_items[:k]
+
+    if only_question_types:
+        qa_items = [i for i in qa_items if i.get("question_type") in only_question_types]
 
     if answerer is None:
         answerer = _build_answerer(
@@ -315,6 +362,7 @@ def evaluate(
                 latency_ms=result.latency_ms,
                 truncated=result.truncated,
                 answer_text=result.text,
+                abstained=result.abstained,
             )
         )
 
@@ -525,6 +573,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="top-k passed to the retriever for reader_direct/reader_con (default: 6)",
     )
+    parser.add_argument(
+        "--only-question-types",
+        action="extend",
+        nargs="+",
+        default=None,
+        help="restrict scoring to these question_type(s) (e.g. adversarial), applied AFTER "
+             "sampling so qa_id pairing with a full run is preserved; default: all types",
+    )
     return parser
 
 
@@ -547,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
                 judge_model=args.judge_model,
                 rendering=args.rendering,
                 retrieve_k=args.retrieve_k,
+                only_question_types=args.only_question_types,
             )
         except RuntimeError as exc:
             print(f"skipping {system_name}: {exc}", file=sys.stderr)

@@ -135,6 +135,10 @@ __all__ = [
     "ReaderDirectAnswerer",
     "ReaderChainOfNoteAnswerer",
     "MedMemGraphAnswerer",
+    "MedMemGraphP1Answerer",
+    "MedMemGraphP2Answerer",
+    "MedMemGraphP1P2Answerer",
+    "MedMemGraphR1Answerer",
 ]
 
 DEFAULT_READER_MODEL = llm.ANSWER_MODEL
@@ -239,26 +243,49 @@ Order matters: the turn pattern is tried first because it is the most common
 unit, and the `as of` pattern before the graph one because a fact unit's bracket
 can also contain a `..` interval."""
 
+_TIMESTAMP_PATTERNS_R1 = _TIMESTAMP_PATTERNS + (
+    # graph TIMELINE bodies:  "TIMELINE for <entity> [2160-08-14 .. present] <enumerated claims>"
+    re.compile(r"^(?P<head>TIMELINE for .*?\[(?P<ts>\d{4}-\d{2}-\d{2}[^\]]*)\].*)$", re.DOTALL),
+    # graph CONTEXT-for-admission bodies:  "CONTEXT for admission <sid> (~2160-08-14) <summary>"
+    re.compile(r"^(?P<head>CONTEXT for admission [^(]*\(~\s*(?P<ts>\d{4}-\d{2}-\d{2}[^)]*)\).*)$", re.DOTALL),
+)
+"""`_TIMESTAMP_PATTERNS` plus the two graph TIMELINE/CONTEXT shapes, used
+only when `aggregation_prompt=True` (arm R1) — gated, not merged into
+`_TIMESTAMP_PATTERNS` itself, so the control's rendering stays byte-identical.
 
-def _split_timestamp(text: str) -> tuple[str | None, str]:
+Added 2026-08-20. TIMELINE and CONTEXT items are the most aggregation-relevant
+evidence this system retrieves (a TIMELINE item is a complete per-entity
+enumeration; see `_CON_STEP3_AGGREGATION_R1`), and until this patch they fell
+through every existing pattern to `(None, text)` — rendered `time: null` /
+"time unknown" to a reader whose prompt explicitly says to order by time. The
+date sits mid-expression in both shapes (inside a bracket/paren that also
+carries other content), same as the graph path pattern above, so the `ts`
+named group is used the same way: `_split_timestamp` returns the text
+UNCHANGED alongside the extracted time rather than trying to strip a prefix."""
+
+
+def _split_timestamp(text: str, *, extra_patterns: bool = False) -> tuple[str | None, str]:
     """Best-effort split of a timestamp off an item's raw text into
     `(time, remaining_text)`.
 
     Tries the EHR-RAG leading-bracket template first (`literature/15`
     R-QCC-045), then the shapes this project's own producers emit
-    (`_TIMESTAMP_PATTERNS`). Returns `(None, text)` when nothing matches — an
-    absent timestamp is rendered as "unknown", never invented.
+    (`_TIMESTAMP_PATTERNS`, or `_TIMESTAMP_PATTERNS_R1` when
+    `extra_patterns=True` — arm R1 only, see `_TIMESTAMP_PATTERNS_R1`'s
+    docstring). Returns `(None, text)` when nothing matches — an absent
+    timestamp is rendered as "unknown", never invented.
 
-    For graph path items the text is returned UNCHANGED alongside the extracted
-    time: the timestamp is embedded mid-expression (`Claim[... 2160-08-14..ongoing]`)
-    rather than being a strippable prefix, and cutting it out would mangle the
-    path rendering the reader needs to read."""
+    For graph path/TIMELINE/CONTEXT items the text is returned UNCHANGED
+    alongside the extracted time: the timestamp is embedded mid-expression
+    (`Claim[... 2160-08-14..ongoing]`) rather than being a strippable prefix,
+    and cutting it out would mangle the rendering the reader needs to read."""
     stripped = text.strip()
     match = _LEADING_TIMESTAMP_RE.match(stripped)
     if match:
         return match.group(1).strip(), match.group(2).strip()
 
-    for pattern in _TIMESTAMP_PATTERNS:
+    patterns = _TIMESTAMP_PATTERNS_R1 if extra_patterns else _TIMESTAMP_PATTERNS
+    for pattern in patterns:
         match = pattern.match(stripped)
         if not match:
             continue
@@ -275,44 +302,78 @@ def _split_timestamp(text: str) -> tuple[str | None, str]:
 
 
 def render_context(
-    items: list[RetrieveItem], rendering: str, *, rng: random.Random | None = None
+    items: list[RetrieveItem],
+    rendering: str,
+    *,
+    rng: random.Random | None = None,
+    aggregation_prompt: bool = False,
 ) -> str:
     """Render retrieved evidence into prompt text under one of three
     strategies (`json` | `prose` | `shuffled`). See module docstring for
-    the literature tension this operationalizes rather than adjudicates."""
+    the literature tension this operationalizes rather than adjudicates.
+
+    `aggregation_prompt=False` (the default) renders exactly as before —
+    control stays byte-identical. `aggregation_prompt=True` (arm R1) is
+    the sole gate on the two rendering fixes below: it recognizes the graph
+    TIMELINE/CONTEXT timestamp shapes (`_TIMESTAMP_PATTERNS_R1`) and drops
+    the RRF-overwritten `score` field, both no-ops when False."""
     if rendering not in _VALID_RENDERINGS:
         raise ValueError(
             f"unknown rendering strategy {rendering!r}; expected one of {sorted(_VALID_RENDERINGS)}"
         )
     if rendering == "json":
-        return _render_json(items)
+        return _render_json(items, aggregation_prompt=aggregation_prompt)
     if rendering == "prose":
-        return _render_prose(items)
-    return _render_prose(items, shuffle=True, rng=rng)
+        return _render_prose(items, aggregation_prompt=aggregation_prompt)
+    return _render_prose(items, shuffle=True, rng=rng, aggregation_prompt=aggregation_prompt)
 
 
-def _render_json(items: list[RetrieveItem]) -> str:
+def _render_json(items: list[RetrieveItem], *, aggregation_prompt: bool = False) -> str:
     """Structured, JSON-per-item rendering — the format LongMemEval's own
-    ablation measured its +10-point gain from (R-QCC-043)."""
+    ablation measured its +10-point gain from (R-QCC-043).
+
+    `aggregation_prompt=True` (arm R1) drops the `score` key. RRF
+    (`graph/fusion.py`) overwrites every channel's own score before this
+    ever runs, so the rendered floats are near-tied and collapse to a
+    handful of distinct values at `.3f` — information-free, and ~405 prompt
+    tokens at k=40 spent stating it. Gated: the control branch below is the
+    unmodified original code, so `aggregation_prompt=False` output is
+    byte-identical to before this change."""
     payload = []
     for idx, item in enumerate(items, start=1):
-        time_, body = _split_timestamp(item.text)
-        payload.append(
-            {
-                "item": idx,
-                "session_id": item.session_id,
-                "turn_ids": list(item.turn_ids),
-                "time": time_,
-                "channel": item.channel,
-                "score": item.score,
-                "text": body,
-            }
-        )
+        time_, body = _split_timestamp(item.text, extra_patterns=aggregation_prompt)
+        if aggregation_prompt:
+            payload.append(
+                {
+                    "item": idx,
+                    "session_id": item.session_id,
+                    "turn_ids": list(item.turn_ids),
+                    "time": time_,
+                    "channel": item.channel,
+                    "text": body,
+                }
+            )
+        else:
+            payload.append(
+                {
+                    "item": idx,
+                    "session_id": item.session_id,
+                    "turn_ids": list(item.turn_ids),
+                    "time": time_,
+                    "channel": item.channel,
+                    "score": item.score,
+                    "text": body,
+                }
+            )
     return json.dumps(payload, indent=2)
 
 
 def _render_prose(
-    items: list[RetrieveItem], *, shuffle: bool = False, rng: random.Random | None = None
+    items: list[RetrieveItem],
+    *,
+    shuffle: bool = False,
+    rng: random.Random | None = None,
+    aggregation_prompt: bool = False,
 ) -> str:
     """One bracketed line per item, in natural-language prose, with
     `session_id`/`turn_ids`/timestamp (if known)/channel/score all rendered
@@ -327,6 +388,10 @@ def _render_prose(
     operationalizes Chroma's "shuffling ... removes local coherence [and]
     consistently improves performance" finding (R-QCC-037) without losing
     the "do not invent/confuse a citation" guarantee.
+
+    `aggregation_prompt=True` (arm R1) drops the ` · score {:.3f}` fragment
+    — see `_render_json`'s docstring for why. Gated the same way: the
+    control branch is the unmodified original code.
     """
     ordered = list(enumerate(items, start=1))
     if shuffle:
@@ -335,12 +400,18 @@ def _render_prose(
 
     lines = []
     for idx, item in ordered:
-        time_, body = _split_timestamp(item.text)
+        time_, body = _split_timestamp(item.text, extra_patterns=aggregation_prompt)
         time_part = f"time {time_}" if time_ else "time unknown"
-        lines.append(
-            f"[Item {idx} · session {item.session_id} · turns {list(item.turn_ids)} · "
-            f"{time_part} · channel {item.channel} · score {item.score:.3f}] {body}"
-        )
+        if aggregation_prompt:
+            lines.append(
+                f"[Item {idx} · session {item.session_id} · turns {list(item.turn_ids)} · "
+                f"{time_part} · channel {item.channel}] {body}"
+            )
+        else:
+            lines.append(
+                f"[Item {idx} · session {item.session_id} · turns {list(item.turn_ids)} · "
+                f"{time_part} · channel {item.channel} · score {item.score:.3f}] {body}"
+            )
     return "\n".join(lines)
 
 
@@ -363,6 +434,124 @@ same schema shape, no extract-then-reason step. This is what the A/B
 compares against (story requirement: "both modes must be available so we
 can A/B them on our own data")."""
 
+_CON_STEP2_REASON = (
+    "STEP 2 -- REASON: using ONLY the notes you wrote in Step 1 -- never "
+    "outside/general knowledge, and never an item you marked IRRELEVANT -- "
+    "answer the QUESTION. If every note is IRRELEVANT, or STRUCTURAL_ABSENCE "
+    'is true below (the retrieval system itself found no connecting '
+    'evidence), respond with the literal string "NOT_IN_RECORD" as the '
+    "answer and set abstained=true. Never state a session id or turn id "
+    "that was not given to you in the evidence below.\n"
+)
+"""Control's STEP 2. Extracted into its own constant (rather than left
+inline in `_CON_SYSTEM`) so it can serve as the anchor `read()` swaps out
+for `_CON_STEP2_PREMISE_CHECK` when `premise_check_prompt=True` (arm P1,
+below) — same splice-by-`.replace()` mechanism `commit_style` already uses
+on `_RESPOND_LINE`. `_CON_SYSTEM` still concatenates this constant in
+directly, so the control arm's prompt string is byte-identical to before
+this constant was pulled out."""
+
+_CON_STEP2_PREMISE_CHECK = (
+    "STEP 2 -- CHECK THE PREMISE: a question can be about a topic your notes "
+    "cover and still ask for a fact the record never states. Name the ONE "
+    "specific thing the QUESTION asks for -- the confirming test or finding, "
+    "the causal or temporal link, the trend across admissions -- then find "
+    "the note(s) that ASSERT it. A note that mentions the same condition, "
+    "drug, organ or admission is on-topic, not an answer. Having many "
+    "relevant notes is not evidence that the question is answerable.\n"
+    "STEP 3 -- REASON: using ONLY the notes you wrote in Step 1 -- never "
+    "outside/general knowledge, and never an item you marked IRRELEVANT -- "
+    "answer the QUESTION. Set abstained=true and answer with the literal "
+    'string "NOT_IN_RECORD" if ANY of these holds: every note is IRRELEVANT; '
+    "STRUCTURAL_ABSENCE is true below (the retrieval system itself found no "
+    "connecting evidence); or no note asserts the specific thing you named "
+    "in Step 2, so that answering would require you to supply the "
+    "confirmation, the causal link or the trend yourself. Assembling a "
+    "sequence or a comparison from several notes that each state a dated "
+    "fact is NOT supplying it yourself -- that is allowed and expected. "
+    "When you abstain, `answer` must be exactly NOT_IN_RECORD and nothing "
+    "else -- do not append what the record does show. "
+    "Never state a session id or turn id that was not given to you in the "
+    "evidence below.\n"
+)
+"""Arm P1's STEP 2/3 (Change C). Diagnosed root cause: the control's ONLY
+abstention trigger is a universal quantifier over topical relevance ("if
+every note is IRRELEVANT"), which decays as (1-p)^k -- at k=40 a single
+on-topic item out of forty disables abstention entirely. The adversarial
+items this project cares about are false-premise questions where evidence
+IS topical, so relevance is the wrong predicate. This version adds an
+explicit premise-check step and makes "no note asserts the specific thing
+asked for" its own abstention trigger, independent of how many notes are
+merely on-topic.
+
+The "Assembling a sequence or a comparison ... is NOT supplying it
+yourself" sentence is LOAD-BEARING: without it this instruction is
+indistinguishable from "abstain unless one note states the whole answer",
+which would wrongly abstain on longitudinal/frequency/cross-admission
+items whose correct answer is genuinely assembled from several dated
+notes. Do not drop or reword it."""
+
+_CON_STEP3_AGGREGATION = (
+    "Two consequences you must respect. (a) TIME: each item carries a time "
+    "field where one is known -- order events by that field, never by the order "
+    "the items happen to appear in. (b) COMPLETENESS: if the question asks "
+    "which thing was most frequent, most consistent, or most common, or how "
+    "something was distributed across admissions, that is a question about the "
+    "WHOLE record. Answer it only if your evidence plainly covers the whole "
+    "span; otherwise say what the evidence does show and state that it is a "
+    "selection. Do not generalise a count from a sample.\n"
+)
+"""Control's "consequences" paragraph. Extracted into its own constant
+(rather than left inline in `_CON_SYSTEM`) so it can serve as the anchor
+`read()` swaps out for `_CON_STEP3_AGGREGATION_R1` when
+`aggregation_prompt=True` (arm R1, below) — same splice-by-`.replace()`
+mechanism `premise_check_prompt`/`_CON_STEP2_PREMISE_CHECK` already uses.
+`_CON_SYSTEM` still concatenates this constant in directly, so the control
+arm's prompt string is byte-identical to before this constant was pulled
+out."""
+
+_CON_STEP3_AGGREGATION_R1 = (
+    "Three consequences you must respect. (a) TIME: each item carries a time "
+    "field where one is known -- order events by that field, never by the order "
+    "the items happen to appear in.\n"
+    "(b) AGGREGATION: some questions have no answer inside any single item -- "
+    "'which X recurred most consistently', 'what persisted across admissions', "
+    "'how did X evolve', 'compare X between two admissions'. Answer these by "
+    "COUNTING AND COMPARING ACROSS your notes, not by quoting the best single "
+    "item: group the relevant notes by admission id, count how many DISTINCT "
+    "admissions each candidate appears in, and NAME the candidate with the "
+    "widest coverage as a specific clinical entity -- a named diagnosis, "
+    "medication, lab value, or symptom. An item whose text begins TIMELINE is "
+    "already a complete enumeration of every claim on record for that entity, "
+    "so a count taken over a TIMELINE item is a count over the whole record, "
+    "not over a sample. 'Several problems recurred' is a wrong answer even "
+    "when true; 'atrial fibrillation, in 4 of the 6 admissions represented "
+    "here' is a right one. Say what your count is over, but still name the "
+    "winner.\n"
+    "(c) YES/NO QUESTIONS: if the question begins Was / Were / Did / Do / Does "
+    "/ Is / Are / Has / Have / Had / Could / Would / Should -- asking whether "
+    "something happened, was associated with something, or led to something -- "
+    "the record must state that comparison or outcome DIRECTLY. If it does "
+    'not, answer "NOT_IN_RECORD" and set abstained=true. Never infer a yes or '
+    "a no from adjacent facts.\n"
+)
+"""Arm R1's consequences paragraph (aggregation_prompt). Diagnosed root
+cause: the answerable-accuracy shortfall is concentrated entirely in the
+three "roll-up" categories that require aggregating across multiple
+retrieved items (longitudinal_progression 0.600, frequency_pattern 0.646,
+cross_admission_comparison 0.646 — 98/156 — versus medical_reasoning /
+care_plan_rationale at 118/120), and the control's own COMPLETENESS clause
+tells the reader to hedge on exactly those questions rather than instructing
+it how to aggregate. This version keeps (a) TIME verbatim, replaces (b)
+COMPLETENESS's hedge-by-default framing with an explicit count-across-notes
+procedure that still requires the model to say what its count is over, and
+adds (c) a YES/NO discipline so implied yes/no questions are not answered
+from adjacent facts.
+
+Independent of `premise_check_prompt`/`premise_check_schema` (P1/P2) by
+design — a later combined arm may want both; this flag never reads or sets
+those, and they never read or set this one."""
+
 _CON_SYSTEM = (
     "You are a clinical question-answering assistant that reads previously "
     "retrieved evidence about a patient in two disciplined steps, per the "
@@ -374,25 +563,12 @@ _CON_SYSTEM = (
     "says that bears on the QUESTION, or the single word IRRELEVANT if it "
     "does not bear on the question at all. Do not skip any item. Do not "
     "merge two items into one note.\n"
-    "STEP 2 -- REASON: using ONLY the notes you wrote in Step 1 -- never "
-    "outside/general knowledge, and never an item you marked IRRELEVANT -- "
-    "answer the QUESTION. If every note is IRRELEVANT, or STRUCTURAL_ABSENCE "
-    'is true below (the retrieval system itself found no connecting '
-    'evidence), respond with the literal string "NOT_IN_RECORD" as the '
-    "answer and set abstained=true. Never state a session id or turn id "
-    "that was not given to you in the evidence below.\n"
+    + _CON_STEP2_REASON +
     "The EVIDENCE PROVENANCE line above the evidence states how many items you "
     "were given, what they were selected from, and in what order. Read it. Your "
     "evidence is a SELECTION, not the patient's complete record, and it is "
     "ordered by retrieval relevance rather than by time.\n"
-    "Two consequences you must respect. (a) TIME: each item carries a time "
-    "field where one is known -- order events by that field, never by the order "
-    "the items happen to appear in. (b) COMPLETENESS: if the question asks "
-    "which thing was most frequent, most consistent, or most common, or how "
-    "something was distributed across admissions, that is a question about the "
-    "WHOLE record. Answer it only if your evidence plainly covers the whole "
-    "span; otherwise say what the evidence does show and state that it is a "
-    "selection. Do not generalise a count from a sample.\n"
+    + _CON_STEP3_AGGREGATION +
     "Respond with the required JSON only: one note object per evidence "
     "item, in the same order, then the answer, then abstained."
 )
@@ -425,7 +601,7 @@ _RESPOND_LINE = (
 )
 
 COMMIT_INSTRUCTION = (
-    "STEP 3 -- COMMIT: state the single most specific claim the evidence "
+    "STEP 4 -- COMMIT: state the single most specific claim the evidence "
     "supports, and state it as a claim rather than as a description. If the "
     "question asks how something changed, progressed, or evolved, or asks you "
     "to compare two points in time, your answer must NAME THE BEFORE-STATE AND "
@@ -437,8 +613,18 @@ COMMIT_INSTRUCTION = (
     "it is true. Choose. If the evidence genuinely supports two competing "
     "readings, give the better-supported one first, in the required form.\n"
 )
-"""The STEP 3 "commit to a before/after claim" instruction, kept separate so
-it can be switched off.
+"""The "commit to a before/after claim" instruction, kept separate so it can
+be switched off.
+
+Renumbered STEP 3 -> STEP 4 on 2026-08-20, when arm P1 (`premise_check_prompt`,
+`_CON_STEP2_PREMISE_CHECK`) inserted its own STEP 3 -- REASON into `_CON_SYSTEM`.
+Unconditional: this text is a module-level constant, not a per-arm splice, so
+if it kept saying "STEP 3" it would collide with P1's STEP 3 whenever both are
+enabled together (the P1+P2 arm needs exactly that combination). Renumbering
+once here, regardless of which arms happen to be on, is simpler and safer than
+threading a second conditional numbering scheme through this text — the label
+is inert prose either way; `commit_style` still gates whether this instruction
+is spliced in at all.
 
 On by default for evaluation, OFF for `demo/agent.py`. The benchmark rewards
 asserting the one transition its gold names; a clinician at the terminal is
@@ -562,6 +748,51 @@ _CON_SCHEMA = {
     "required": ["notes", "answer", "abstained"],
     "additionalProperties": False,
 }
+
+
+def _premise_check_schema(base: dict) -> dict:
+    """Arm P2 (Change D): `base` (`_CON_SCHEMA`) with a descriptive
+    `premise_check` field inserted and the property order changed to
+    `notes -> premise_check -> abstained -> answer`.
+
+    Structured-output decoding emits properties in schema order, so the
+    control's `notes -> answer -> abstained` order lets the model write
+    `answer` first and have `abstained` merely rationalise it after the
+    fact. Reordering so `abstained` is decided BEFORE `answer` is written
+    forces the decision to happen first; `premise_check` gives it a place
+    to reason about that decision instead of jumping straight to a
+    boolean.
+
+    Deep-copies `base` (same `json` round-trip `_transition_schema` uses)
+    so this never shares, and cannot accidentally mutate, `_CON_SCHEMA`'s
+    own dict — the control's schema object must stay untouched.
+
+    `premise_check` MUST stay a DESCRIPTIVE field ("name the thing asked
+    for and which notes assert it"), never a yes/no verdict, and must never
+    be concatenated into `answer`. `TRANSITION_TYPES`/`_transition_schema`
+    (above) is the recorded cautionary tale: an extra REQUIRED schema field
+    there manufactured a contradicting clinical term that the judge
+    penalised, once its content started leaking toward the answer's
+    meaning. `premise_check` here is read by the model as reasoning
+    scaffolding, never read back by this module into `answer`."""
+    out = json.loads(json.dumps(base))
+    notes_schema = out["properties"]["notes"]
+    out["properties"] = {
+        "notes": notes_schema,
+        "premise_check": {"type": "string"},
+        "abstained": {"type": "boolean"},
+        "answer": {"type": "string"},
+    }
+    out["required"] = ["notes", "premise_check", "abstained", "answer"]
+    return out
+
+
+_CON_SCHEMA_PREMISE_CHECK = _premise_check_schema(_CON_SCHEMA)
+"""Arm P2's schema — built once at import time from `_CON_SCHEMA`, never
+mutating it. Selected in `read()` only when `premise_check_schema=True`
+and `mode == "chain_of_note"`; the control (`medmemgraph`) never
+constructs or touches this object, so `_CON_SCHEMA` itself stays exactly
+as it was before Change D."""
 
 
 def describe_evidence(
@@ -867,6 +1098,9 @@ def read(
     corpus: EvidenceProvenance | None = None,
     commit_style: bool = False,
     question_type: str | None = None,
+    premise_check_prompt: bool = False,
+    premise_check_schema: bool = False,
+    aggregation_prompt: bool = False,
 ) -> Answer:
     """Answer `question` over already-retrieved `items`. Never retrieves —
     this function never calls the graph/vector retriever or the corpus
@@ -882,7 +1116,27 @@ def read(
     (`_stub_complete`) — no network call, no key needed, no cost.
 
     `guardrail_enabled=False` (the default) is a genuine no-op — see module
-    docstring's "Optional post-step" section for the full contract."""
+    docstring's "Optional post-step" section for the full contract.
+
+    `premise_check_prompt` (arm P1) and `premise_check_schema` (arm P2) are
+    independently toggleable, both default False, both no-ops outside
+    `mode="chain_of_note"` (they touch `_CON_SYSTEM`/`_CON_SCHEMA`, not the
+    `direct` mode's prompt/schema) — mirrors `commit_style`'s flag
+    plumbing exactly, so `control` (both False), `P1`, `P2`, and `P1+P2`
+    (both True) are four reachable combinations from the same code path.
+
+    `aggregation_prompt` (arm R1) is a fifth, independent toggle: default
+    False, deliberately uncoupled from `premise_check_prompt`/
+    `premise_check_schema`. Its prompt splice (replacing
+    `_CON_STEP3_AGGREGATION`, the "(a) TIME / (b) COMPLETENESS" paragraph —
+    not `_CON_STEP2_REASON` or `_CON_SCHEMA`) is a no-op outside
+    `mode="chain_of_note"`, same as P1/P2, so it composes with either or
+    both without this function needing to know about that combination in
+    advance. Unlike P1/P2, it ALSO gates two `render_context()` rendering
+    fixes (graph TIMELINE/CONTEXT timestamp recognition; dropping the
+    RRF-overwritten `score` field) that apply in EITHER mode, since
+    rendering happens once before mode-specific prompt/schema selection —
+    see `render_context`'s docstring."""
     if mode not in _VALID_MODES:
         raise ValueError(f"unknown reader mode {mode!r}; expected one of {sorted(_VALID_MODES)}")
     if rendering not in _VALID_RENDERINGS:
@@ -912,8 +1166,16 @@ def read(
             latency_ms=latency_ms,
         )
 
-    context_text = render_context(items, rendering, rng=rng)
+    context_text = render_context(items, rendering, rng=rng, aggregation_prompt=aggregation_prompt)
     system_prompt = _CON_SYSTEM if mode == "chain_of_note" else _DIRECT_SYSTEM
+    if premise_check_prompt and mode == "chain_of_note":
+        system_prompt = system_prompt.replace(
+            _CON_STEP2_REASON, _CON_STEP2_PREMISE_CHECK
+        )
+    if aggregation_prompt and mode == "chain_of_note":
+        system_prompt = system_prompt.replace(
+            _CON_STEP3_AGGREGATION, _CON_STEP3_AGGREGATION_R1
+        )
     if commit_style:
         system_prompt = system_prompt.replace(
             _RESPOND_LINE, COMMIT_INSTRUCTION + _RESPOND_LINE
@@ -922,6 +1184,8 @@ def read(
         question, context_text, structural_absence, rendering, items=items, corpus=corpus
     )
     schema = _CON_SCHEMA if mode == "chain_of_note" else _DIRECT_SCHEMA
+    if premise_check_schema and mode == "chain_of_note":
+        schema = _CON_SCHEMA_PREMISE_CHECK
     transition = commit_style and question_type in TRANSITION_TYPES
     if transition:
         schema = _transition_schema(schema)
@@ -1052,6 +1316,9 @@ class ReaderAnswerer:
         guardrail_enabled: bool = False,
         guardrail_policy: str = "warn",
         commit_style: bool = False,
+        premise_check_prompt: bool = False,
+        premise_check_schema: bool = False,
+        aggregation_prompt: bool = False,
     ) -> None:
         self.rendering = rendering
         self.k = k
@@ -1060,6 +1327,9 @@ class ReaderAnswerer:
         self.guardrail_enabled = guardrail_enabled
         self.guardrail_policy = guardrail_policy
         self.commit_style = commit_style
+        self.premise_check_prompt = premise_check_prompt
+        self.premise_check_schema = premise_check_schema
+        self.aggregation_prompt = aggregation_prompt
         # `client` is accepted (not removed) only for call-site compatibility
         # with `eval/baselines/dense.py` / `eval/baselines/lexical.py`, which
         # both construct a `ReaderAnswerer` (via subclassing) with a
@@ -1137,12 +1407,16 @@ class ReaderAnswerer:
             corpus=corpus,
             commit_style=self.commit_style,
             question_type=question_type,
+            premise_check_prompt=self.premise_check_prompt,
+            premise_check_schema=self.premise_check_schema,
+            aggregation_prompt=self.aggregation_prompt,
         )
         return AnswerResult(
             text=result.text,
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
             latency_ms=result.latency_ms,
+            abstained=result.abstained,
         )
 
 
@@ -1208,4 +1482,70 @@ class MedMemGraphAnswerer(ReaderChainOfNoteAnswerer):
             from medmemgraph.graph.retrieve import retrieve_for_eval
 
             kwargs["retriever"] = retrieve_for_eval
+        super().__init__(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Toggleable arms — same retrieval/reading as `medmemgraph` (the control),
+# differing only in the abstention-trigger mechanism under test, so a cheap
+# adversarial-only screen (`harness.evaluate(..., only_question_types=
+# ["adversarial"])`) can compare `control`, `P1`, `P2`, `P1+P2` paired on
+# identical items. Each subclass only sets its own toggle's default via
+# `kwargs.setdefault` (never overrides an explicit caller value), then
+# defers to `MedMemGraphAnswerer.__init__` for the k=40 / retrieve_for_eval
+# wiring every arm shares. Plain `medmemgraph` (above) sets neither flag and
+# is therefore unchanged by their existence.
+# ---------------------------------------------------------------------------
+
+
+class MedMemGraphP1Answerer(MedMemGraphAnswerer):
+    """Arm P1: `_CON_SYSTEM`'s STEP 2 replaced by an explicit premise-check
+    step (Change C, `_CON_STEP2_PREMISE_CHECK`) — abstention no longer
+    depends solely on "every note is IRRELEVANT"."""
+
+    name = "medmemgraph_p1"
+
+    def __init__(self, **kwargs) -> None:
+        kwargs.setdefault("premise_check_prompt", True)
+        super().__init__(**kwargs)
+
+
+class MedMemGraphP2Answerer(MedMemGraphAnswerer):
+    """Arm P2: `_CON_SCHEMA` reordered so `abstained` is decided (with a
+    descriptive `premise_check` reasoning field) before `answer` is written
+    (Change D, `_CON_SCHEMA_PREMISE_CHECK`)."""
+
+    name = "medmemgraph_p2"
+
+    def __init__(self, **kwargs) -> None:
+        kwargs.setdefault("premise_check_schema", True)
+        super().__init__(**kwargs)
+
+
+class MedMemGraphP1P2Answerer(MedMemGraphAnswerer):
+    """Arm P1+P2: both the prompt premise-check (Change C) and the schema
+    decide-before-answer reordering (Change D) together."""
+
+    name = "medmemgraph_p1p2"
+
+    def __init__(self, **kwargs) -> None:
+        kwargs.setdefault("premise_check_prompt", True)
+        kwargs.setdefault("premise_check_schema", True)
+        super().__init__(**kwargs)
+
+
+class MedMemGraphR1Answerer(MedMemGraphAnswerer):
+    """Arm R1: `_CON_SYSTEM`'s consequences paragraph replaced by an
+    explicit count-across-notes aggregation procedure plus a yes/no-question
+    discipline (`_CON_STEP3_AGGREGATION_R1`) — targets the
+    longitudinal_progression / frequency_pattern / cross_admission_comparison
+    shortfall, not the abstention mechanism P1/P2 target. Independent of
+    `premise_check_prompt`/`premise_check_schema`: this class only sets
+    `aggregation_prompt`, so it composes with P1/P2 in a later combined arm
+    without either flag needing to know about the other."""
+
+    name = "medmemgraph_r1"
+
+    def __init__(self, **kwargs) -> None:
+        kwargs.setdefault("aggregation_prompt", True)
         super().__init__(**kwargs)

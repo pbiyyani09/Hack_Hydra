@@ -39,6 +39,13 @@ SYSTEMS="${SYSTEMS:-nomem fullctx dense lexical medmemgraph}"
 # k=60 -> 0.775).
 # `nomem`/`fullctx` ignore this flag (no `k` in their constructors).
 RETRIEVE_K="${RETRIEVE_K:-40}"
+# Optional cheap-screen filter: space-separated question_type(s) (e.g.
+# "adversarial", or "adversarial longitudinal_progression") to restrict
+# scoring to, applied AFTER stratified sampling so qa_id pairing with a full
+# (unfiltered) run at the same PER_TYPE/SEED is preserved. Left empty by
+# default so existing behaviour — every system scored on every sampled
+# question_type — is byte-identical to before this flag existed.
+ONLY_TYPES="${ONLY_TYPES:-}"
 
 export MEDMEMGRAPH_LLM_CACHE_DIR="${MEDMEMGRAPH_LLM_CACHE_DIR:-$PWD/data/llm_cache}"
 
@@ -50,7 +57,16 @@ echo "systems  : $SYSTEMS"
 echo "patients : $(echo "$patients" | wc -w)"
 echo "sampling : --stratify-per-type $PER_TYPE --seed $SEED"
 echo "cache    : $MEDMEMGRAPH_LLM_CACHE_DIR"
+if [ -n "$ONLY_TYPES" ]; then
+  echo "only     : $ONLY_TYPES"
+fi
 echo
+
+# shellcheck disable=SC2206  # ONLY_TYPES is intentionally word-split, one --only-question-types value per type
+only_types_args=()
+if [ -n "$ONLY_TYPES" ]; then
+  only_types_args=(--only-question-types $ONLY_TYPES)
+fi
 
 for patient in $patients; do
   for system in $SYSTEMS; do
@@ -67,6 +83,7 @@ for patient in $patients; do
       --seed "$SEED" \
       --retrieve-k "$RETRIEVE_K" \
       --results-dir "$RESULTS_DIR" \
+      "${only_types_args[@]}" \
       >/dev/null || echo "    FAILED $patient/$system" >&2
   done
 done

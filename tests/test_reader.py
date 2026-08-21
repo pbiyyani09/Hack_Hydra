@@ -677,6 +677,89 @@ class TestTimestampExtractionMatchesRealProducers:
         assert "time unknown" not in render_context(items, "prose")
 
 
+class TestAggregationArmTimestampExtraction:
+    """`_split_timestamp(..., extra_patterns=True)` / `render_context(...,
+    aggregation_prompt=True)` — the graph TIMELINE/CONTEXT shapes added
+    2026-08-20 for arm R1 (`medmemgraph_r1`, `aggregation_prompt`).
+
+    These bodies start with a bare word (`TIMELINE`/`CONTEXT`), not a
+    bracket, so `_TIMESTAMP_PATTERNS` (the control's set) never matches them
+    — they fall through to `(None, text)` exactly like everything else that
+    doesn't match. That is the CONTROL behaviour under test here, and it
+    must stay unchanged. `_TIMESTAMP_PATTERNS_R1` recognizes them, but only
+    when `extra_patterns=True`/`aggregation_prompt=True` is explicitly
+    passed — the gate this whole class exists to pin down."""
+
+    TIMELINE_TEXT = (
+        "TIMELINE for atrial fibrillation [2160-08-14 .. present] asserted in "
+        "4 of 6 admissions on record"
+    )
+    CONTEXT_TEXT = (
+        "CONTEXT for admission 20971116 (~2160-08-14T00:00:00) patient presented "
+        "with recurrent atrial fibrillation"
+    )
+
+    def test_control_does_not_recognize_timeline_shape(self):
+        time_, body = _split_timestamp(self.TIMELINE_TEXT)
+        assert time_ is None
+        assert body == self.TIMELINE_TEXT
+
+    def test_control_does_not_recognize_context_shape(self):
+        time_, body = _split_timestamp(self.CONTEXT_TEXT)
+        assert time_ is None
+        assert body == self.CONTEXT_TEXT
+
+    def test_r1_recognizes_timeline_shape_and_keeps_text_intact(self):
+        time_, body = _split_timestamp(self.TIMELINE_TEXT, extra_patterns=True)
+        assert time_ is not None and time_.startswith("2160-08-14")
+        assert body == self.TIMELINE_TEXT, "mid-expression date: text must survive unchanged"
+
+    def test_r1_recognizes_context_shape_and_keeps_text_intact(self):
+        time_, body = _split_timestamp(self.CONTEXT_TEXT, extra_patterns=True)
+        assert time_ is not None and time_.startswith("2160-08-14")
+        assert body == self.CONTEXT_TEXT, "mid-expression date: text must survive unchanged"
+
+    def test_rendered_json_time_is_null_for_control_but_populated_for_r1(self):
+        items = [RetrieveItem(text=self.TIMELINE_TEXT, session_id="H3", turn_ids=[1], score=0.5, channel="graph")]
+        control = json.loads(render_context(items, "json"))
+        assert control[0]["time"] is None
+        r1 = json.loads(render_context(items, "json", aggregation_prompt=True))
+        assert r1[0]["time"] is not None and r1[0]["time"].startswith("2160-08-14")
+
+    def test_rendered_prose_time_unknown_for_control_but_populated_for_r1(self):
+        items = [RetrieveItem(text=self.CONTEXT_TEXT, session_id="H3", turn_ids=[2], score=0.5, channel="graph")]
+        assert "time unknown" in render_context(items, "prose")
+        assert "time unknown" not in render_context(items, "prose", aggregation_prompt=True)
+
+
+class TestAggregationArmDropsScore:
+    """`render_context(..., aggregation_prompt=True)` drops the `score`
+    field from both renderings — RRF (`graph/fusion.py`) overwrites every
+    channel's own score before rendering ever runs, so the value is
+    information-free by the time it reaches the reader. Control must keep
+    carrying `score` exactly as before (`tests/test_reader.py` never
+    asserts on the rendered `score` value itself, only on `RetrieveItem`
+    construction, so this drop cannot regress an existing control test)."""
+
+    def test_control_json_still_carries_score(self):
+        items = [_item("plain text, no timestamp")]
+        payload = json.loads(render_context(items, "json"))
+        assert "score" in payload[0]
+
+    def test_r1_json_drops_score(self):
+        items = [_item("plain text, no timestamp")]
+        payload = json.loads(render_context(items, "json", aggregation_prompt=True))
+        assert "score" not in payload[0]
+
+    def test_control_prose_still_carries_score(self):
+        items = [_item("plain text, no timestamp")]
+        assert "score" in render_context(items, "prose")
+
+    def test_r1_prose_drops_score(self):
+        items = [_item("plain text, no timestamp")]
+        assert "score" not in render_context(items, "prose", aggregation_prompt=True)
+
+
 class TestTransitionForcingIsOffAndStaysOff:
     """The forced before/after schema is disabled after measuring that it hurt.
 

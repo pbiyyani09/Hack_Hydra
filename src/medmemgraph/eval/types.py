@@ -95,6 +95,14 @@ class AnswerResult:
     truncated: bool = False
     turns_dropped: int = 0
     tokens_dropped: int = 0
+    abstained: bool = False
+    """Whether the system itself declined to answer (its own structured
+    `abstained` flag, e.g. `reader.Answer.abstained` — never inferred by
+    regexing `.text`). Defaults False so baselines that never abstain
+    (nomem/fullctx) don't have to set it. Added so a results file can
+    distinguish "model declined but judge disagreed" from "model never
+    declined" (previously dropped at the `AnswerResult` boundary and lost
+    before it ever reached a `Record`)."""
 
     @property
     def total_tokens(self) -> int:
